@@ -6,3 +6,6 @@ enableXsrfProtection = false
 
 [browser]
 gatherUsageStats = false
+
+[logger]
+level = "info"
