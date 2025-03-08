@@ -22,6 +22,7 @@ import random
 from tenacity import retry, stop_after_attempt, wait_exponential
 import tempfile
 import validators
+import subprocess
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -38,16 +39,49 @@ class Config:
     MAX_AUDIO_DURATION = 3000  # 50 minutes
     DEFAULT_SEGMENT_DURATION = 5  # seconds
 
-# Initialize resources
+# Initialize resources with robust model downloading
 def initialize_resources():
     Config.CACHE_DIR.mkdir(exist_ok=True)
-    return (spacy.load('en_core_web_sm'),
-            pipeline('automatic-speech-recognition', 
-                    model='openai/whisper-large-v3',
-                    device=0 if torch.cuda.is_available() else -1),
-            ThreadPoolExecutor(max_workers=Config.MAX_WORKERS))
+    
+    # Ensure Spacy model is downloaded
+    model_name = 'en_core_web_sm'
+    try:
+        nlp = spacy.load(model_name)
+    except OSError:
+        logger.info(f"Spacy model '{model_name}' not found. Attempting to download...")
+        try:
+            # Use Spacy's built-in download command with a check for success
+            result = subprocess.run(
+                ["python", "-m", "spacy", "download", model_name],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            logger.info(f"Spacy model download output: {result.stdout}")
+            nlp = spacy.load(model_name)
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to download Spacy model: {e.stderr}")
+            raise RuntimeError(f"Could not download Spacy model '{model_name}': {e.stderr}")
+        except Exception as e:
+            logger.error(f"Unexpected error downloading Spacy model: {str(e)}")
+            raise RuntimeError(f"Unexpected error downloading Spacy model: {str(e)}")
+    
+    # Initialize other resources
+    transcriber = pipeline(
+        'automatic-speech-recognition',
+        model='openai/whisper-large-v3',
+        device=0 if torch.cuda.is_available() else -1
+    )
+    thread_pool = ThreadPoolExecutor(max_workers=Config.MAX_WORKERS)
+    
+    return nlp, transcriber, thread_pool
 
-nlp, transcriber, thread_pool = initialize_resources()
+# Initialize resources at startup
+try:
+    nlp, transcriber, thread_pool = initialize_resources()
+except Exception as e:
+    st.error(f"Failed to initialize resources: {str(e)}")
+    st.stop()
 
 # Cache management
 def manage_cache():
@@ -80,12 +114,10 @@ def transcribe_and_segment_audio(audio_file, segment_duration=Config.DEFAULT_SEG
             import json
             return json.loads(cache_file.read_text())
 
-        # Save audio temporarily
         with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp:
             tmp.write(file_bytes)
             tmp_path = tmp.name
 
-        # Transcription with timestamps
         result = transcriber(tmp_path, return_timestamps=True)
         chunks = result['chunks']
         audio = AudioFileClip(tmp_path)
@@ -94,9 +126,8 @@ def transcribe_and_segment_audio(audio_file, segment_duration=Config.DEFAULT_SEG
         if total_duration > Config.MAX_AUDIO_DURATION:
             raise ValueError("Audio exceeds 50 minutes")
 
-        # Segment audio
         num_segments = int(total_duration // segment_duration)
-        segments = []
+        segmentsycat = []
         
         for i in range(num_segments):
             start = i * segment_duration
@@ -112,7 +143,6 @@ def transcribe_and_segment_audio(audio_file, segment_duration=Config.DEFAULT_SEG
             segment_text = " ".join(c['text'] for c in segment_chunks)
             segments.append({"start": start, "end": end, "text": segment_text})
 
-        # Cache results
         import json
         cache_file.write_text(json.dumps(segments))
         
@@ -247,7 +277,6 @@ def create_text_image(text, resolution):
 
 def enhance_image(image, resolution):
     try:
-        # Resize to target resolution
         image = image.resize(resolution, Image.LANCZOS)
         
         img_array = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
@@ -277,7 +306,7 @@ def create_video(segments, audio_path, video_format):
         clips = []
         for segment in segments:
             keywords = extract_keywords(segment['text']) if segment['text'] else ['generic scene']
-            images = scrape_images(keywords[0])  # Use first keyword
+            images = scrape_images(keywords[0])
             
             if not images:
                 img_path = create_text_image(segment['text'] or "No transcription available", resolution)
