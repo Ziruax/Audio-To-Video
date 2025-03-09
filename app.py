@@ -18,6 +18,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 import validators
 import time
 import spacy
+import soundfile as sf
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -66,7 +67,7 @@ def transcribe_segment(args):
         segment_audio = audio_data[int(start * sample_rate):int(end * sample_rate)]
         segment_audio = segment_audio.astype(np.float32) / (np.max(np.abs(segment_audio)) or 1)
         audio_path = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-        librosa.output.write_wav(audio_path, segment_audio, sample_rate)
+        sf.write(audio_path, segment_audio, sample_rate)
         result = model.transcribe(audio_path, language="en")
         os.unlink(audio_path)
         return result["text"]
@@ -117,7 +118,7 @@ def extract_transcribed_keywords(audio_file, segment_duration=Config.DEFAULT_SEG
         for i, future in enumerate(as_completed(futures)):
             transcription = future.result()
             keywords = extract_keywords_from_transcription(transcription)
-            for kw in keywords[:]:  # Avoid duplicates across segments
+            for kw in keywords[:]:
                 if kw in used_keywords:
                     keywords.remove(kw)
             if not keywords:
