@@ -1,15 +1,11 @@
-streamlit==1.20.0
-librosa==0.9.2
-numpy==1.23.5
-moviepy==1.0.3
-requests==2.31.0
-beautifulsoup4==4.12.2
-pillow==10.0.0
-spacy==3.6.1
-soundfile==0.12.1
-validators==0.22.0
-tenacity==8.2.3
-openai-whisper==20231117
-ffmpeg-python==0.2.0
-en-core-web-sm==3.6.0  # Explicitly pinned to match spacy==3.6.1
-setuptools==74.1.2    # For distutils compatibility
+streamlit
+librosa
+numpy
+moviepy
+Pillow
+spacy
+PySoundFile
+openai-whisper
+diffusers
+torch
+transformers
