@@ -44,21 +44,13 @@ def initialize_resources():
 
 thread_pool = initialize_resources()
 
-# Load models once
+# Load Whisper model once
 @st.cache_resource
-def load_models():
-    logger.info("Loading ML models...")
-    whisper_model = whisper.load_model("tiny", device="cpu")
-    kandinsky_model = None
-    try:
-        from diffusers import KandinskyV22Pipeline
-        kandinsky_model = KandinskyV22Pipeline.from_pretrained("kandinsky-community/kandinsky-2-2-decoder").to("cpu")
-        logger.info("Kandinsky model loaded successfully.")
-    except (ImportError, Exception) as e:
-        logger.warning(f"Failed to load Kandinsky model: {e}. AI image generation will be disabled.")
-    return whisper_model, kandinsky_model
+def load_whisper_model():
+    logger.info("Loading Whisper model...")
+    return whisper.load_model("tiny", device="cpu")
 
-whisper_model, kandinsky_model = load_models()
+whisper_model = load_whisper_model()
 
 # Cache management
 def manage_cache():
@@ -242,24 +234,6 @@ def scrape_images(transcription, keywords, used_keywords=None):
         logger.error(f"Image scraping error for '{keywords}': {e}")
         return Image.new("RGB", (320, 180), "gray")
 
-# Image generation
-def generate_image_task(transcription, keywords):
-    from PIL import Image
-    try:
-        if not kandinsky_model:
-            raise ValueError("Kandinsky model not available")
-        prompt = f"A high quality, vibrant image depicting {transcription}, featuring {' and '.join(keywords)}, detailed and colorful"
-        image = kandinsky_model(prompt, num_inference_steps=5, height=180, width=320).images[0]
-        logger.info(f"Generated image for prompt: {prompt}")
-        return image
-    except Exception as e:
-        logger.error(f"Image generation error: {e}")
-        return Image.new("RGB", (320, 180), "gray")
-
-def generate_images(transcription, keywords):
-    future = thread_pool.submit(generate_image_task, transcription, keywords)
-    return future.result()
-
 # Image enhancement
 def crop_to_aspect(image, aspect_ratio):
     target_aspect = aspect_ratio[0] / aspect_ratio[1]
@@ -284,14 +258,13 @@ def enhance_image(image, resolution, aspect_ratio):
         return image
 
 # Video creation
-def process_segment(segment, image_source, resolution, aspect_ratio, used_keywords):
+def process_segment(segment, resolution, aspect_ratio, used_keywords):
     keywords = tuple(segment["keywords"])
     if keywords in used_keywords:
         keywords = (keywords[0] + str(random.randint(1, 1000)),)
     used_keywords.add(keywords)
     
-    img = (scrape_images(segment["transcription"], segment["keywords"], used_keywords) if image_source == "scrape" 
-           else generate_images(segment["transcription"], segment["keywords"]))
+    img = scrape_images(segment["transcription"], segment["keywords"], used_keywords)
     enhanced_img = enhance_image(img, resolution, aspect_ratio)
     clip = mpy.ImageSequenceClip([np.array(enhanced_img)], fps=Config.VIDEO_FPS)
     duration = segment["end"] - segment["start"]
@@ -299,7 +272,7 @@ def process_segment(segment, image_source, resolution, aspect_ratio, used_keywor
     clip = clip.resize(lambda t: 1 + 0.1 * (t / duration))
     return clip
 
-def create_video(segments, audio_path, image_source, quality, video_format):
+def create_video(segments, audio_path, quality, video_format):
     output_path = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False).name
     try:
         audio = mpy.AudioFileClip(audio_path)
@@ -312,7 +285,7 @@ def create_video(segments, audio_path, image_source, quality, video_format):
         resolution = resolutions[quality][video_format]
         
         used_keywords = set()
-        futures = [thread_pool.submit(process_segment, segment, image_source, resolution, aspect_ratio, used_keywords) 
+        futures = [thread_pool.submit(process_segment, segment, resolution, aspect_ratio, used_keywords) 
                    for segment in segments]
         
         clips = []
@@ -345,11 +318,9 @@ def create_video(segments, audio_path, image_source, quality, video_format):
 
 # Streamlit UI
 def main():
-    st.set_page_config(page_title="Audio to Video Generator", layout="wide")
-    st.title("🎥 Audio to Video Generator")
-    st.markdown(f"Convert audio to video with scraped or generated images. Max {Config.MAX_AUDIO_DURATION // 60} min.")
-    if not kandinsky_model:
-        st.warning("AI image generation is unavailable due to model loading issues. Only web scraping will be used.")
+    st.set_page_config(page_title="Audio to Video (Web Scraped)", layout="wide")
+    st.title("🎥 Audio to Video Generator (Web Scraped Images)")
+    st.markdown(f"Convert audio to video using images scraped from the web. Max {Config.MAX_AUDIO_DURATION // 60} min.")
 
     with st.sidebar:
         st.header("Settings")
@@ -373,12 +344,6 @@ def main():
             st.text(f"Transcription: {segment['transcription']}")
             st.text(f"Keywords: {', '.join(segment['keywords'])}")
         
-        image_source_options = ["Scrape from Web"]
-        if kandinsky_model:
-            image_source_options.append("Generate with AI")
-        image_source = st.radio("Choose Image Source", image_source_options, index=0)
-        image_source_key = "scrape" if image_source == "Scrape from Web" else "generate"
-        
         col1, col2 = st.columns(2)
         with col1:
             if st.button("Generate Video"):
@@ -387,11 +352,11 @@ def main():
                     progress_bar = st.progress(0)
                     progress_bar.progress(0.2)
                     
-                    status.write(f"{'Scraping images' if image_source_key == 'scrape' else 'Generating images'}...")
+                    status.write("Scraping images...")
                     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_audio:
                         tmp_audio.write(audio_file.getvalue())
                         tmp_audio_path = tmp_audio.name
-                        video_path = create_video(segments, tmp_audio_path, image_source_key, quality, video_format)
+                        video_path = create_video(segments, tmp_audio_path, quality, video_format)
                     progress_bar.progress(0.8)
                     
                     if video_path:
@@ -403,7 +368,7 @@ def main():
                             st.download_button(
                                 "Download Video",
                                 f,
-                                file_name=f"generated_video_{time.strftime('%Y%m%d_%H%M%S')}.mp4",
+                                file_name=f"scraped_video_{time.strftime('%Y%m%d_%H%M%S')}.mp4",
                                 mime="video/mp4"
                             )
                         os.unlink(video_path)
