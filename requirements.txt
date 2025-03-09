@@ -3,7 +3,7 @@ requests>=2.25.0
 beautifulsoup4>=4.9.0
 pillow>=8.0.0
 numpy>=1.19.0
-moviepy>=1.0.3
+moviepy==1.0.3
 librosa>=0.10.0
 tenacity>=8.0.0
 validators>=0.18.0
