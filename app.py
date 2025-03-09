@@ -350,7 +350,6 @@ def main():
             if not segments:
                 return
         
-        # Display transcriptions
         for i, segment in enumerate(segments):
             st.write(f"Segment {i} ({segment['start']:.1f}s - {segment['end']:.1f}s):")
             st.text(f"Transcription: {segment['transcription']}")
