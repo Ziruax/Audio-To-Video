@@ -9,6 +9,7 @@ beautifulsoup4>=4.9.0
 pillow>=8.0.0
 tenacity>=8.0.0
 validators>=0.18.0
-whisper>=20230918  # Using openai-whisper
+openai-whisper>=2023.11.17  # Correct package for OpenAI Whisper
 spacy>=3.5.0
 en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.5.0/en_core_web_sm-3.5.0-py3-none-any.whl
+soundfile>=0.12.1  # Replaces deprecated librosa.output
