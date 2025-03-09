@@ -11,5 +11,5 @@ validators==0.22.0
 tenacity==8.2.3
 openai-whisper==20231117
 ffmpeg-python==0.2.0
-en-core-web-sm==3.6.0
-setuptools==74.1.2  # Added to provide distutils for Python 3.12
+en-core-web-sm==3.6.0  # Explicitly pinned to match spacy==3.6.1
+setuptools==74.1.2    # For distutils compatibility
