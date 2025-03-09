@@ -31,7 +31,7 @@ class Config:
     MAX_WORKERS = min(os.cpu_count() * 2, 10) if os.cpu_count() else 4
     MAX_IMAGES_PER_KEYWORD = 5
     VIDEO_FPS = 24
-    MIN_IMAGE_RESOLUTION = (400, 400)
+    MIN_IMAGE_RESOLUTION = (300, 300)  # Relaxed from (400, 400)
     MAX_AUDIO_DURATION = 3000  # 50 minutes
     DEFAULT_SEGMENT_DURATION = 5  # seconds
 
@@ -62,7 +62,7 @@ def manage_cache():
 def get_file_hash(file_bytes):
     return hashlib.sha256(file_bytes).hexdigest()
 
-# Audio segmentation (without transcription)
+# Audio segmentation
 def segment_audio(audio_file, segment_duration=Config.DEFAULT_SEGMENT_DURATION):
     try:
         file_bytes = audio_file.getvalue()
@@ -73,7 +73,6 @@ def segment_audio(audio_file, segment_duration=Config.DEFAULT_SEGMENT_DURATION):
             import json
             return json.loads(cache_file.read_text())
 
-        # Get audio duration using soundfile
         audio_data, sample_rate = sf.read(BytesIO(file_bytes))
         total_duration = len(audio_data) / sample_rate
         
@@ -86,7 +85,7 @@ def segment_audio(audio_file, segment_duration=Config.DEFAULT_SEGMENT_DURATION):
         for i in range(num_segments):
             start = i * segment_duration
             end = min((i + 1) * segment_duration, total_duration)
-            segments.append({"start": start, "end": end, "text": f"Segment {i+1}"})  # Placeholder text
+            segments.append({"start": start, "end": end, "text": f"Segment {i+1}"})
         
         if total_duration % segment_duration:
             start = num_segments * segment_duration
@@ -102,15 +101,11 @@ def segment_audio(audio_file, segment_duration=Config.DEFAULT_SEGMENT_DURATION):
         st.error(f"Failed to segment audio: {e}")
         return None
 
-# Simple keyword extraction using pure Python
+# Keyword extraction
 def extract_keywords(text, min_keywords=3, max_keywords=10):
-    # Basic tokenization and noun-like word extraction
     words = re.findall(r'\b\w+\b', text.lower())
-    # Filter for potential keywords (longer words, no common stop words)
     stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with'}
     keywords = [word for word in words if len(word) > 3 and word not in stop_words]
-    
-    # Return unique keywords up to max_keywords
     return list(dict.fromkeys(keywords))[:max_keywords] or ["generic", "scene"]
 
 # Image processing
@@ -121,34 +116,51 @@ def validate_image(img):
     try:
         width, height = img.size
         if width < Config.MIN_IMAGE_RESOLUTION[0] or height < Config.MIN_IMAGE_RESOLUTION[1]:
+            logger.warning(f"Image rejected: Size {width}x{height} below minimum {Config.MIN_IMAGE_RESOLUTION}")
             return False
-        
         img_array = np.array(img)
         brightness = np.mean(img_array)
         if brightness < 30 or brightness > 225:
+            logger.warning(f"Image rejected: Brightness {brightness} out of range")
             return False
-        
         return True
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Image validation failed: {e}")
         return False
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def fetch_image(url):
-    if not validators.url(url):
-        raise ValueError("Invalid URL")
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    }
-    response = requests.get(url, headers=headers, timeout=15)
-    return Image.open(BytesIO(response.content)).convert('RGB')
+    try:
+        if not validators.url(url):
+            raise ValueError("Invalid URL")
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        img = Image.open(BytesIO(response.content)).convert('RGB')
+        logger.info(f"Successfully fetched image from {url}")
+        return img
+    except Exception as e:
+        logger.warning(f"Failed to fetch image from {url}: {e}")
+        raise
 
 def scrape_images(keyword, num_images=Config.MAX_IMAGES_PER_KEYWORD):
     cache_key = hashlib.sha256(keyword.encode()).hexdigest()
     cache_dir = Config.CACHE_DIR / f'img_{cache_key}'
     cache_dir.mkdir(exist_ok=True)
     
-    cached_images = [Image.open(p) for p in cache_dir.glob('*.png') if validate_image(Image.open(p))]
+    cached_images = []
+    for p in cache_dir.glob('*.png'):
+        try:
+            img = Image.open(p)
+            if validate_image(img):
+                cached_images.append(img)
+        except Exception as e:
+            logger.warning(f"Failed to load cached image {p}: {e}")
+    
     if len(cached_images) >= num_images:
+        logger.info(f"Using {len(cached_images)} cached images for '{keyword}'")
         return cached_images[:num_images]
 
     platforms = [
@@ -162,57 +174,68 @@ def scrape_images(keyword, num_images=Config.MAX_IMAGES_PER_KEYWORD):
     }
     
     img_urls = set()
-    try:
-        for platform in random.sample(platforms, min(2, len(platforms))):
-            try:
-                response = requests.get(platform, headers=headers, timeout=10)
-                response.raise_for_status()
-                soup = BeautifulSoup(response.text, 'html.parser')
-                
-                for img in soup.find_all('img'):
-                    src = img.get('src')
-                    if src and src.startswith('http') and not src.endswith('.gif'):
-                        img_urls.add(src)
-                        
-            except Exception as e:
-                logger.warning(f"Failed to scrape {platform}: {e}")
-                continue
-        
-        futures = [thread_pool.submit(fetch_image, url) for url in list(img_urls)[:num_images * 2]]
-        images = []
-        
-        for i, future in enumerate(as_completed(futures)):
-            try:
-                img = future.result()
-                if validate_image(img):
-                    img_path = cache_dir / f'img_{i}.png'
-                    img.save(img_path)
-                    images.append(img)
-                    if len(images) >= num_images:
-                        break
-            except Exception as e:
-                logger.warning(f"Image fetch failed: {e}")
-                continue
-                
-        return images if images else cached_images
-    except Exception as e:
-        logger.error(f"Image scraping error: {e}")
-        return cached_images if cached_images else []
+    for platform in random.sample(platforms, min(2, len(platforms))):
+        try:
+            response = requests.get(platform, headers=headers, timeout=10)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, 'html.parser')
+            for img in soup.find_all('img'):
+                src = img.get('src')
+                if src and src.startswith('http') and not src.endswith('.gif'):
+                    img_urls.add(src)
+            logger.info(f"Found {len(img_urls)} image URLs from {platform}")
+        except Exception as e:
+            logger.warning(f"Failed to scrape {platform}: {e}")
+    
+    if not img_urls:
+        logger.error(f"No image URLs found for '{keyword}'")
+    
+    futures = [thread_pool.submit(fetch_image, url) for url in list(img_urls)[:num_images * 2]]
+    images = []
+    
+    for i, future in enumerate(as_completed(futures)):
+        try:
+            img = future.result()
+            if validate_image(img):
+                img_path = cache_dir / f'img_{i}.png'
+                img.save(img_path)
+                images.append(img)
+                logger.info(f"Saved valid image {img_path}")
+                if len(images) >= num_images:
+                    break
+        except Exception as e:
+            logger.warning(f"Image fetch failed: {e}")
+    
+    if not images and cached_images:
+        logger.info(f"Falling back to {len(cached_images)} cached images")
+        return cached_images[:num_images]
+    
+    if not images:
+        logger.error(f"No valid images scraped for '{keyword}'")
+    
+    return images
 
 def create_text_image(text, resolution):
-    img = Image.new('RGB', resolution, color=(73, 109, 137))
-    d = ImageDraw.Draw(img)
-    font = ImageFont.load_default()  # Use default font, no external dependency
-    d.text((10, 10), text, font=font, fill=(255, 255, 0))
-    path = Config.CACHE_DIR / f"text_{int(time.time())}.png"
-    img.save(path)
-    return path
+    try:
+        img = Image.new('RGB', resolution, color=(73, 109, 137))
+        d = ImageDraw.Draw(img)
+        font = ImageFont.load_default()
+        d.text((10, 10), text, font=font, fill=(255, 255, 0))
+        path = Config.CACHE_DIR / f"text_{int(time.time())}.png"
+        img.save(path)
+        logger.info(f"Created text image at {path}")
+        return path
+    except Exception as e:
+        logger.error(f"Failed to create text image: {e}")
+        raise
 
 def enhance_image(image, resolution):
     try:
         image = image.resize(resolution, Image.LANCZOS)
         img_pil = ImageEnhance.Color(image).enhance(1.15)
-        return ImageEnhance.Contrast(img_pil).enhance(1.1)
+        enhanced = ImageEnhance.Contrast(img_pil).enhance(1.1)
+        logger.info(f"Enhanced image to resolution {resolution}")
+        return enhanced
     except Exception as e:
         logger.error(f"Image enhancement error: {e}")
         return image
@@ -228,21 +251,31 @@ def create_video(segments, audio_path, video_format):
         clips = []
         for segment in segments:
             keywords = extract_keywords(segment['text']) if segment['text'] else ['generic scene']
+            logger.info(f"Processing segment with keywords: {keywords}")
             images = scrape_images(keywords[0])
             
             if not images:
+                logger.warning(f"No images for segment {segment['text']}, creating text image")
                 img_path = create_text_image(segment['text'] or "No transcription available", resolution)
                 img = Image.open(img_path)
             else:
                 img = images[0]
             
             enhanced_img = enhance_image(img, resolution)
-            clip = ImageSequenceClip([np.array(enhanced_img)], fps=Config.VIDEO_FPS)
-            clip = clip.set_duration(segment['end'] - segment['start'])
-            clip = clip.set_start(segment['start'])
-            clip = vfx.fadein(clip, 0.5).fx(vfx.fadeout, 0.5)
-            clip = clip.fx(vfx.resize, lambda t: 1 + 0.02 * t)
-            clips.append(clip)
+            try:
+                clip = ImageSequenceClip([np.array(enhanced_img)], fps=Config.VIDEO_FPS)
+                clip = clip.set_duration(segment['end'] - segment['start'])
+                clip = clip.set_start(segment['start'])
+                clip = vfx.fadein(clip, 0.5).fx(vfx.fadeout, 0.5)
+                clip = clip.fx(vfx.resize, lambda t: 1 + 0.02 * t)
+                clips.append(clip)
+                logger.info(f"Added clip for segment {segment['start']}-{segment['end']}")
+            except Exception as e:
+                logger.error(f"Failed to create clip for segment {segment['text']}: {e}")
+                continue
+        
+        if not clips:
+            raise ValueError("No valid clips created for video")
         
         final_clip = concatenate_videoclips(clips, method="compose")
         final_clip = final_clip.set_audio(audio)
@@ -256,6 +289,7 @@ def create_video(segments, audio_path, video_format):
             threads=Config.MAX_WORKERS,
             logger=None
         )
+        logger.info(f"Video created at {output_path}")
         return output_path
     except Exception as e:
         logger.error(f"Video creation error: {e}")
@@ -273,11 +307,11 @@ def create_video(segments, audio_path, video_format):
 def main():
     st.set_page_config(page_title="Audio to Video Generator", layout="wide")
     st.title("🎥 Audio to Video Generator")
-    st.markdown("Convert your audio into videos with synchronized images. Note: Transcription not available; uses segment placeholders.")
+    st.markdown("Convert your audio into videos with synchronized images. Note: Uses segment placeholders.")
 
     with st.sidebar:
         st.header("Settings")
-        num_images = st.slider("Images per keyword", 1, 10, Config.MAX_IMAGES_PER_KEYWORD)
+        num_images = st.slider("Images per keyword", 1, 5, Config.MAX_IMAGES_PER_KEYWORD)
         segment_duration = st.slider("Segment Duration (seconds)", 3, 15, Config.DEFAULT_SEGMENT_DURATION)
         video_format = st.selectbox("Video Format", ["16:9", "9:16", "1:1"], index=0)
         quality = st.selectbox("Video Quality", ["Low", "Medium", "High"], index=1)
@@ -298,7 +332,7 @@ def main():
                         return
                     progress_bar.progress(0.2)
                     
-                    status_text.text("Extracting keywords...")
+                    status_text.text("Extracting keywords and fetching images...")
                     for i, seg in enumerate(segments):
                         seg['keywords'] = extract_keywords(seg['text'])
                         progress_bar.progress(0.2 + (i + 1) * 0.3 / len(segments))
@@ -321,6 +355,8 @@ def main():
                                 mime="video/mp4"
                             )
                         os.unlink(video_path)
+                    else:
+                        st.error("Video creation failed. Check logs for details.")
                         
         with col2:
             st.audio(audio_file)
