@@ -5,7 +5,7 @@ from PIL import Image, ImageEnhance
 import numpy as np
 from moviepy.editor import ImageSequenceClip, VideoFileClip, AudioFileClip, concatenate_videoclips, vfx
 import os
-import soundfile as sf
+import librosa
 from io import BytesIO
 import time
 import logging
@@ -20,8 +20,6 @@ import tempfile
 import validators
 import re
 from collections import Counter
-from transformers import pipeline
-import torch
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -70,20 +68,7 @@ def manage_cache():
 def get_file_hash(file_bytes):
     return hashlib.sha256(file_bytes).hexdigest()
 
-# Initialize transformers pipelines (local, no API)
-def initialize_pipelines():
-    try:
-        asr_pipeline = pipeline("automatic-speech-recognition", model="facebook/wav2vec2-base-960h", device=-1)
-        ner_pipeline = pipeline("ner", model="dslim/bert-base-NER", device=-1)
-        logger.info("Transformers pipelines initialized")
-        return asr_pipeline, ner_pipeline
-    except Exception as e:
-        logger.error(f"Failed to initialize pipelines: {e}")
-        return None, None
-
-asr_pipeline, ner_pipeline = initialize_pipelines()
-
-# Audio transcription and keyword extraction
+# Audio analysis and keyword extraction with librosa
 def extract_audio_keywords(audio_file, segment_duration=Config.DEFAULT_SEGMENT_DURATION):
     try:
         file_bytes = audio_file.getvalue()
@@ -95,7 +80,8 @@ def extract_audio_keywords(audio_file, segment_duration=Config.DEFAULT_SEGMENT_D
             logger.info(f"Using cached segments: {cache_file}")
             return json.loads(cache_file.read_text())
 
-        audio_data, sample_rate = sf.read(BytesIO(file_bytes))
+        # Load audio with librosa
+        audio_data, sample_rate = librosa.load(BytesIO(file_bytes), sr=None)
         total_duration = len(audio_data) / sample_rate
         
         if total_duration > Config.MAX_AUDIO_DURATION:
@@ -104,15 +90,13 @@ def extract_audio_keywords(audio_file, segment_duration=Config.DEFAULT_SEGMENT_D
         segments = []
         num_segments = int(total_duration // segment_duration)
         
-        # Keyword dictionary for fallback
-        keyword_dict = {
-            "music": ["music", "song", "melody"],
-            "nature": ["nature", "forest", "river"],
-            "city": ["city", "urban", "street"],
-            "people": ["people", "crowd", "person"],
-            "technology": ["tech", "computer", "device"],
-            "food": ["food", "meal", "dish"],
-            "travel": ["travel", "journey", "destination"]
+        # Expanded keyword pool
+        keyword_pool = {
+            "high_energy": ["party", "dance", "concert", "festival", "energy"],
+            "medium_energy": ["conversation", "meeting", "city", "street", "people"],
+            "low_energy": ["nature", "forest", "river", "calm", "sky"],
+            "music": ["music", "instrument", "song", "melody", "guitar"],
+            "silence": ["background", "abstract", "texture", "pattern", "scene"]
         }
 
         for i in range(num_segments):
@@ -120,56 +104,37 @@ def extract_audio_keywords(audio_file, segment_duration=Config.DEFAULT_SEGMENT_D
             end = min((i + 1) * segment_duration, total_duration)
             segment_audio = audio_data[int(start * sample_rate):int(end * sample_rate)]
             
-            if asr_pipeline and ner_pipeline:
-                try:
-                    # Normalize audio to float32 between -1 and 1
-                    segment_audio = segment_audio.astype(np.float32) / np.max(np.abs(segment_audio))
-                    transcription = asr_pipeline({"raw": segment_audio, "sampling_rate": sample_rate})["text"].lower()
-                    ner_results = ner_pipeline(transcription)
-                    entities = [res["word"] for res in ner_results if res["entity"].startswith("B-") and len(res["word"]) > 3]
-                    
-                    words = re.findall(r'\b\w+\b', transcription)
-                    stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'is', 'was', 'are'}
-                    word_freq = Counter(word for word in words if word not in stop_words and len(word) > 3)
-                    freq_keywords = [word for word, _ in word_freq.most_common(3)]
-                    
-                    keywords = list(dict.fromkeys(entities + freq_keywords))[:Config.MAX_KEYWORDS] or ["scene"]
-                    logger.info(f"Segment {i}: Keywords {keywords} from '{transcription}'")
-                except Exception as e:
-                    logger.warning(f"Transcription failed for segment {i}: {e}, falling back to amplitude analysis")
-                    avg_amplitude = np.mean(np.abs(segment_audio))
-                    keywords = random.choice(list(keyword_dict.values()))[:Config.MAX_KEYWORDS] if avg_amplitude > 0.1 else ["background"]
-            else:
-                avg_amplitude = np.mean(np.abs(segment_audio))
-                keywords = random.choice(list(keyword_dict.values()))[:Config.MAX_KEYWORDS] if avg_amplitude > 0.1 else ["background"]
-                logger.info(f"Segment {i}: Fallback keywords {keywords} (no transcription)")
+            # Analyze audio energy
+            energy = np.mean(librosa.feature.rms(y=segment_audio)[0])
+            if energy > 0.05:  # High energy (e.g., music, loud speech)
+                category = "high_energy" if energy > 0.1 else "music"
+            elif energy > 0.01:  # Medium energy (e.g., conversation)
+                category = "medium_energy"
+            else:  # Low energy or silence
+                category = "low_energy" if energy > 0.005 else "silence"
+            
+            # Ensure unique keywords per segment
+            available_keywords = [kw for kw in keyword_pool[category] if not any(kw in seg["keywords"] for seg in segments)]
+            if not available_keywords:
+                available_keywords = keyword_pool[category]  # Fallback to full list if all used
+            keywords = random.sample(available_keywords, min(Config.MAX_KEYWORDS, len(available_keywords)))
             
             segments.append({"start": start, "end": end, "keywords": keywords})
+            logger.info(f"Segment {i}: Keywords {keywords} (energy: {energy:.4f})")
         
         if total_duration % segment_duration:
             start = num_segments * segment_duration
             end = total_duration
             segment_audio = audio_data[int(start * sample_rate):int(end * sample_rate)]
-            if asr_pipeline and ner_pipeline:
-                try:
-                    segment_audio = segment_audio.astype(np.float32) / np.max(np.abs(segment_audio))
-                    transcription = asr_pipeline({"raw": segment_audio, "sampling_rate": sample_rate})["text"].lower()
-                    ner_results = ner_pipeline(transcription)
-                    entities = [res["word"] for res in ner_results if res["entity"].startswith("B-") and len(res["word"]) > 3]
-                    word_freq = Counter(word for word in re.findall(r'\b\w+\b', transcription) if word not in stop_words and len(word) > 3)
-                    freq_keywords = [word for word, _ in word_freq.most_common(3)]
-                    keywords = list(dict.fromkeys(entities + freq_keywords))[:Config.MAX_KEYWORDS] or ["scene"]
-                    logger.info(f"Final segment: Keywords {keywords} from '{transcription}'")
-                except Exception as e:
-                    logger.warning(f"Transcription failed for final segment: {e}, falling back")
-                    avg_amplitude = np.mean(np.abs(segment_audio))
-                    keywords = random.choice(list(keyword_dict.values()))[:Config.MAX_KEYWORDS] if avg_amplitude > 0.1 else ["background"]
-            else:
-                avg_amplitude = np.mean(np.abs(segment_audio))
-                keywords = random.choice(list(keyword_dict.values()))[:Config.MAX_KEYWORDS] if avg_amplitude > 0.1 else ["background"]
-                logger.info(f"Final segment: Fallback keywords {keywords}")
+            energy = np.mean(librosa.feature.rms(y=segment_audio)[0])
+            category = "high_energy" if energy > 0.1 else "medium_energy" if energy > 0.01 else "low_energy" if energy > 0.005 else "silence"
+            available_keywords = [kw for kw in keyword_pool[category] if not any(kw in seg["keywords"] for seg in segments)]
+            if not available_keywords:
+                available_keywords = keyword_pool[category]
+            keywords = random.sample(available_keywords, min(Config.MAX_KEYWORDS, len(available_keywords)))
             
             segments.append({"start": start, "end": end, "keywords": keywords})
+            logger.info(f"Final segment: Keywords {keywords} (energy: {energy:.4f})")
 
         import json
         cache_file.write_text(json.dumps(segments))
@@ -222,7 +187,9 @@ def fetch_image(url):
         logger.warning(f"Failed to fetch image from {url}: {e}")
         raise
 
-def scrape_images(keywords, num_images=Config.MAX_IMAGES_PER_KEYWORD):
+def scrape_images(keywords, num_images=Config.MAX_IMAGES_PER_KEYWORD, used_keywords=None):
+    if used_keywords is None:
+        used_keywords = set()
     try:
         cache_key = hashlib.sha256("".join(keywords).encode()).hexdigest()
         cache_dir = Config.CACHE_DIR / f'img_{cache_key}'
@@ -254,6 +221,8 @@ def scrape_images(keywords, num_images=Config.MAX_IMAGES_PER_KEYWORD):
         
         images = []
         for keyword in keywords:
+            if keyword in used_keywords:
+                continue  # Skip already used keywords
             img_urls = set()
             for platform_fn in random.sample(platforms, len(platforms)):
                 platform = platform_fn(keyword)
@@ -290,6 +259,7 @@ def scrape_images(keywords, num_images=Config.MAX_IMAGES_PER_KEYWORD):
                         img_path = cache_dir / f'img_{i}_{keyword}.png'
                         img.save(img_path)
                         images.append(img)
+                        used_keywords.add(keyword)
                         logger.info(f"Saved image {img_path}")
                         if len(images) >= num_images:
                             break
@@ -300,7 +270,7 @@ def scrape_images(keywords, num_images=Config.MAX_IMAGES_PER_KEYWORD):
                 break
         
         if not images:
-            refined_keywords = [kw + " photo" for kw in keywords]
+            refined_keywords = [kw + " photo" for kw in keywords if kw not in used_keywords]
             for keyword in refined_keywords:
                 for platform_fn in platforms:
                     platform = platform_fn(keyword)
@@ -331,6 +301,7 @@ def scrape_images(keywords, num_images=Config.MAX_IMAGES_PER_KEYWORD):
                                 img_path = cache_dir / f'img_{i}_{keyword}.png'
                                 img.save(img_path)
                                 images.append(img)
+                                used_keywords.add(keyword.split()[0])  # Add base keyword
                                 logger.info(f"Saved refined image {img_path}")
                                 if len(images) >= num_images:
                                     break
@@ -367,13 +338,14 @@ def create_video(segments, audio_path, video_format, quality):
         resolution = get_resolution(video_format, quality)
         
         clips = []
+        used_keywords = set()
         for segment in segments:
             if not isinstance(segment, dict) or "keywords" not in segment:
                 logger.error(f"Invalid segment format: {segment}")
                 raise ValueError(f"Segment must be a dict with 'keywords': {segment}")
             
             keywords = segment["keywords"]
-            images = scrape_images(keywords)
+            images = scrape_images(keywords, used_keywords=used_keywords)
             
             img = images[0]
             enhanced_img = enhance_image(img, resolution)
