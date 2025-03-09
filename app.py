@@ -3,7 +3,7 @@ import requests
 from bs4 import BeautifulSoup
 from PIL import Image, ImageEnhance
 import numpy as np
-from moviepy.editor import ImageSequenceClip, VideoFileClip, AudioFileClip, concatenate_videoclips, vfx
+import moviepy.editor as mpy  # Import moviepy safely
 import os
 import librosa
 from io import BytesIO
@@ -18,8 +18,7 @@ import random
 from tenacity import retry, stop_after_attempt, wait_exponential
 import tempfile
 import validators
-import re
-from collections import Counter
+import json
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -76,11 +75,9 @@ def extract_audio_keywords(audio_file, segment_duration=Config.DEFAULT_SEGMENT_D
         cache_file = Config.CACHE_DIR / f'segments_{file_hash}.json'
 
         if cache_file.exists():
-            import json
             logger.info(f"Using cached segments: {cache_file}")
             return json.loads(cache_file.read_text())
 
-        # Load audio with librosa
         audio_data, sample_rate = librosa.load(BytesIO(file_bytes), sr=None)
         total_duration = len(audio_data) / sample_rate
         
@@ -90,7 +87,6 @@ def extract_audio_keywords(audio_file, segment_duration=Config.DEFAULT_SEGMENT_D
         segments = []
         num_segments = int(total_duration // segment_duration)
         
-        # Expanded keyword pool
         keyword_pool = {
             "high_energy": ["party", "dance", "concert", "festival", "energy"],
             "medium_energy": ["conversation", "meeting", "city", "street", "people"],
@@ -104,19 +100,17 @@ def extract_audio_keywords(audio_file, segment_duration=Config.DEFAULT_SEGMENT_D
             end = min((i + 1) * segment_duration, total_duration)
             segment_audio = audio_data[int(start * sample_rate):int(end * sample_rate)]
             
-            # Analyze audio energy
             energy = np.mean(librosa.feature.rms(y=segment_audio)[0])
-            if energy > 0.05:  # High energy (e.g., music, loud speech)
+            if energy > 0.05:
                 category = "high_energy" if energy > 0.1 else "music"
-            elif energy > 0.01:  # Medium energy (e.g., conversation)
+            elif energy > 0.01:
                 category = "medium_energy"
-            else:  # Low energy or silence
+            else:
                 category = "low_energy" if energy > 0.005 else "silence"
             
-            # Ensure unique keywords per segment
             available_keywords = [kw for kw in keyword_pool[category] if not any(kw in seg["keywords"] for seg in segments)]
             if not available_keywords:
-                available_keywords = keyword_pool[category]  # Fallback to full list if all used
+                available_keywords = keyword_pool[category]
             keywords = random.sample(available_keywords, min(Config.MAX_KEYWORDS, len(available_keywords)))
             
             segments.append({"start": start, "end": end, "keywords": keywords})
@@ -136,7 +130,6 @@ def extract_audio_keywords(audio_file, segment_duration=Config.DEFAULT_SEGMENT_D
             segments.append({"start": start, "end": end, "keywords": keywords})
             logger.info(f"Final segment: Keywords {keywords} (energy: {energy:.4f})")
 
-        import json
         cache_file.write_text(json.dumps(segments))
         logger.info(f"Segmented audio into {len(segments)} segments with keywords")
         return segments
@@ -222,7 +215,7 @@ def scrape_images(keywords, num_images=Config.MAX_IMAGES_PER_KEYWORD, used_keywo
         images = []
         for keyword in keywords:
             if keyword in used_keywords:
-                continue  # Skip already used keywords
+                continue
             img_urls = set()
             for platform_fn in random.sample(platforms, len(platforms)):
                 platform = platform_fn(keyword)
@@ -270,50 +263,8 @@ def scrape_images(keywords, num_images=Config.MAX_IMAGES_PER_KEYWORD, used_keywo
                 break
         
         if not images:
-            refined_keywords = [kw + " photo" for kw in keywords if kw not in used_keywords]
-            for keyword in refined_keywords:
-                for platform_fn in platforms:
-                    platform = platform_fn(keyword)
-                    try:
-                        response = requests.get(platform, headers=headers, timeout=10)
-                        soup = BeautifulSoup(response.text, 'html.parser')
-                        img_urls = set()
-                        if 'google.com' in platform:
-                            for img in soup.select('img[src]'):
-                                src = img['src']
-                                if src.startswith('http') and not src.startswith('data:') and not src.endswith('.gif'):
-                                    img_urls.add(src)
-                        elif 'bing.com' in platform:
-                            for img in soup.select('img[src]'):
-                                src = img['src']
-                                if src.startswith('http') and not src.endswith('.gif'):
-                                    img_urls.add(src)
-                        else:
-                            for img in soup.find_all('img'):
-                                src = img.get('src')
-                                if src and src.startswith('http') and not src.endswith('.gif'):
-                                    img_urls.add(src)
-                        
-                        futures = [thread_pool.submit(fetch_image, url) for url in list(img_urls)[:num_images * 5]]
-                        for i, future in enumerate(as_completed(futures)):
-                            img = future.result()
-                            if validate_image(img, keywords):
-                                img_path = cache_dir / f'img_{i}_{keyword}.png'
-                                img.save(img_path)
-                                images.append(img)
-                                used_keywords.add(keyword.split()[0])  # Add base keyword
-                                logger.info(f"Saved refined image {img_path}")
-                                if len(images) >= num_images:
-                                    break
-                        if images:
-                            break
-                    except Exception as e:
-                        logger.warning(f"Retry failed for {platform}: {e}")
-                if images:
-                    break
-        
-        if not images:
-            raise ValueError(f"Failed to scrape any valid images for '{keywords}' after retries")
+            logger.warning(f"No images found for '{keywords}'")
+            raise ValueError(f"Failed to scrape images for '{keywords}'")
         
         return images[:num_images]
     except Exception as e:
@@ -334,38 +285,28 @@ def enhance_image(image, resolution):
 def create_video(segments, audio_path, video_format, quality):
     output_path = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False).name
     try:
-        audio = AudioFileClip(audio_path)
+        audio = mpy.AudioFileClip(audio_path)
         resolution = get_resolution(video_format, quality)
         
         clips = []
         used_keywords = set()
         for segment in segments:
-            if not isinstance(segment, dict) or "keywords" not in segment:
-                logger.error(f"Invalid segment format: {segment}")
-                raise ValueError(f"Segment must be a dict with 'keywords': {segment}")
-            
             keywords = segment["keywords"]
             images = scrape_images(keywords, used_keywords=used_keywords)
             
             img = images[0]
             enhanced_img = enhance_image(img, resolution)
-            try:
-                clip = ImageSequenceClip([np.array(enhanced_img)], fps=Config.VIDEO_FPS)
-                duration = segment["end"] - segment["start"]
-                clip = clip.set_duration(duration)
-                clip = clip.set_start(segment["start"])
-                clip = vfx.fadein(clip, min(0.5, duration/2)).fx(vfx.fadeout, min(0.5, duration/2))
-                clips.append(clip)
-                logger.info(f"Added clip for {segment['start']}-{segment['end']} with keywords {keywords}")
-            except Exception as e:
-                logger.error(f"Clip creation failed for segment: {e}")
-                continue
+            clip = mpy.ImageSequenceClip([np.array(enhanced_img)], fps=Config.VIDEO_FPS)
+            duration = segment["end"] - segment["start"]
+            clip = clip.set_duration(duration).set_start(segment["start"])
+            clip = clip.fx(mpy.vfx.fadein, min(0.5, duration/2)).fx(mpy.vfx.fadeout, min(0.5, duration/2))
+            clips.append(clip)
+            logger.info(f"Added clip for {segment['start']}-{segment['end']} with keywords {keywords}")
         
         if not clips:
             raise ValueError("No valid clips created")
         
-        final_clip = concatenate_videoclips(clips, method="compose")
-        final_clip = final_clip.set_audio(audio)
+        final_clip = mpy.concatenate_videoclips(clips, method="compose").set_audio(audio)
         
         preset = {"Low": "veryfast", "Medium": "fast", "High": "medium"}[quality]
         final_clip.write_videofile(
@@ -377,7 +318,7 @@ def create_video(segments, audio_path, video_format, quality):
             threads=Config.MAX_WORKERS,
             logger=None
         )
-        logger.info(f"Video created at {output_path} with {quality} quality")
+        logger.info(f"Video created at {output_path}")
         return output_path
     except Exception as e:
         logger.error(f"Video creation error: {e}")
@@ -399,10 +340,9 @@ def main():
 
     with st.sidebar:
         st.header("Settings")
-        num_images = st.slider("Images per keyword", 1, 2, Config.MAX_IMAGES_PER_KEYWORD)
         segment_duration = st.slider("Segment Duration (seconds)", 3, 10, Config.DEFAULT_SEGMENT_DURATION)
         video_format = st.selectbox("Video Format", ["16:9", "9:16", "1:1"], index=0)
-        quality = st.selectbox("Video Quality", ["Low", "Medium", "High"], index=1)  # Medium default
+        quality = st.selectbox("Video Quality", ["Low", "Medium", "High"], index=1)
 
     audio_file = st.file_uploader(f"Upload Audio File (Max {Config.MAX_AUDIO_DURATION // 60} min)", type=['wav', 'mp3', 'm4a'])
     
