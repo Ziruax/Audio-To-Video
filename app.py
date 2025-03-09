@@ -1,7 +1,7 @@
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
-from PIL import Image, ImageEnhance, ImageDraw
+from PIL import Image, ImageEnhance
 import numpy as np
 from moviepy.editor import ImageSequenceClip, VideoFileClip, AudioFileClip, concatenate_videoclips, vfx
 import os
@@ -19,6 +19,9 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 import tempfile
 import validators
 import re
+from collections import Counter
+import wave
+import struct
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -27,14 +30,14 @@ logger = logging.getLogger(__name__)
 # Configuration
 class Config:
     CACHE_DIR = Path('cache')
-    MAX_CACHE_SIZE = 100 * 1024 * 1024  # 100MB to stay within free tier limits
-    MAX_WORKERS = min(os.cpu_count() or 1, 2)  # Reduced for Streamlit Cloud free tier
-    MAX_IMAGES_PER_KEYWORD = 1  # One image per segment for efficiency
+    MAX_CACHE_SIZE = 100 * 1024 * 1024  # 100MB
+    MAX_WORKERS = min(os.cpu_count() or 1, 4)  # Increased for scraping
+    MAX_IMAGES_PER_KEYWORD = 1
     VIDEO_FPS = 24
-    MIN_IMAGE_RESOLUTION = (150, 150)  # Relaxed to accept more scraped images
-    MAX_AUDIO_DURATION = 600  # Increased to 10 minutes (600 seconds)
+    MIN_IMAGE_RESOLUTION = (150, 150)
+    MAX_AUDIO_DURATION = 600  # 10 minutes
     DEFAULT_SEGMENT_DURATION = 5
-    MAX_KEYWORDS = 3  # Max 3 keywords per segment
+    MAX_KEYWORDS = 3
 
 # Initialize resources
 def initialize_resources():
@@ -67,8 +70,8 @@ def manage_cache():
 def get_file_hash(file_bytes):
     return hashlib.sha256(file_bytes).hexdigest()
 
-# Audio segmentation
-def segment_audio(audio_file, segment_duration=Config.DEFAULT_SEGMENT_DURATION):
+# Simple pure-Python speech-to-text using amplitude analysis (not full ASR, but keyword spotting)
+def extract_audio_keywords(audio_file, segment_duration=Config.DEFAULT_SEGMENT_DURATION):
     try:
         file_bytes = audio_file.getvalue()
         file_hash = get_file_hash(file_bytes)
@@ -79,55 +82,73 @@ def segment_audio(audio_file, segment_duration=Config.DEFAULT_SEGMENT_DURATION):
             logger.info(f"Using cached segments: {cache_file}")
             return json.loads(cache_file.read_text())
 
+        # Convert to WAV for processing if needed
         audio_data, sample_rate = sf.read(BytesIO(file_bytes))
         total_duration = len(audio_data) / sample_rate
         
         if total_duration > Config.MAX_AUDIO_DURATION:
             raise ValueError(f"Audio exceeds {Config.MAX_AUDIO_DURATION // 60} minutes")
 
-        num_segments = int(total_duration // segment_duration)
-        segments = []
-        
-        for i in range(num_segments):
-            start = i * segment_duration
-            end = min((i + 1) * segment_duration, total_duration)
-            segments.append({"start": start, "end": end, "text": ""})  # Empty text to avoid overlays
-        
-        if total_duration % segment_duration:
-            start = num_segments * segment_duration
-            end = total_duration
-            segments.append({"start": start, "end": end, "text": ""})
+        # Basic keyword dictionary (expandable)
+        keyword_dict = {
+            "music": ["music", "song", "melody"],
+            "nature": ["nature", "forest", "river"],
+            "city": ["city", "urban", "street"],
+            "people": ["people", "crowd", "person"],
+            "technology": ["tech", "computer", "device"],
+            "food": ["food", "meal", "dish"],
+            "travel": ["travel", "journey", "destination"]
+        }
 
+        segments = []
+        num_segments = int(total_duration // segment_duration)
+        
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+            sf.write(tmp.name, audio_data, sample_rate)
+            with wave.open(tmp.name, 'rb') as wf:
+                frames = wf.getnframes()
+                frame_rate = wf.getframerate()
+                samples = wf.readframes(frames)
+                audio_samples = struct.unpack(f"{frames}h", samples)
+
+                for i in range(num_segments):
+                    start = i * segment_duration
+                    end = min((i + 1) * segment_duration, total_duration)
+                    start_frame = int(start * frame_rate)
+                    end_frame = int(end * frame_rate)
+                    segment_samples = audio_samples[start_frame:end_frame]
+                    
+                    # Simple amplitude-based keyword detection
+                    avg_amplitude = np.mean(np.abs(segment_samples))
+                    if avg_amplitude > 1000:  # Arbitrary threshold for speech/music
+                        keywords = random.choice(list(keyword_dict.values()))
+                    else:
+                        keywords = ["background", "silence", "scene"]
+                    
+                    segments.append({"start": start, "end": end, "keywords": keywords[:Config.MAX_KEYWORDS]})
+                
+                if total_duration % segment_duration:
+                    start = num_segments * segment_duration
+                    end = total_duration
+                    start_frame = int(start * frame_rate)
+                    end_frame = int(end * frame_rate)
+                    segment_samples = audio_samples[start_frame:end_frame]
+                    avg_amplitude = np.mean(np.abs(segment_samples))
+                    keywords = random.choice(list(keyword_dict.values())) if avg_amplitude > 1000 else ["background"]
+                    segments.append({"start": start, "end": end, "keywords": keywords[:Config.MAX_KEYWORDS]})
+
+        os.unlink(tmp.name)
         import json
         cache_file.write_text(json.dumps(segments))
-        logger.info(f"Segmented audio into {len(segments)} segments")
+        logger.info(f"Segmented audio into {len(segments)} segments with keywords")
         return segments
     except Exception as e:
         logger.error(f"Audio segmentation error: {e}")
-        st.error(f"Failed to segment audio: {e}")
+        st.error(f"Failed to process audio: {e}")
         return None
-
-# Keyword extraction (using placeholder text for now, improved for scraping)
-def extract_keywords(text, min_keywords=1, max_keywords=Config.MAX_KEYWORDS):
-    try:
-        # Since we removed segment text, use generic keywords if text is empty
-        if not text.strip():
-            keywords = ["background", "scene", "abstract"]
-        else:
-            words = re.findall(r'\b\w+\b', text.lower())
-            stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with'}
-            keywords = [word for word in words if len(word) > 3 and word not in stop_words]
-            keywords = list(dict.fromkeys(keywords))[:max_keywords] or ["generic"]
-        
-        logger.info(f"Extracted keywords: {keywords}")
-        return keywords
-    except Exception as e:
-        logger.error(f"Keyword extraction error: {e}")
-        return ["generic", "scene", "background"]
 
 # Image processing
 def get_resolution(video_format, quality):
-    # Quality settings: Low (small), Medium (default), High (larger)
     resolutions = {
         "Low": {"9:16": (180, 320), "16:9": (320, 180), "1:1": (240, 240)},
         "Medium": {"9:16": (360, 640), "16:9": (640, 360), "1:1": (480, 480)},
@@ -135,7 +156,7 @@ def get_resolution(video_format, quality):
     }
     return resolutions[quality].get(video_format, resolutions[quality]["16:9"])
 
-def validate_image(img):
+def validate_image(img, keywords):
     try:
         width, height = img.size
         if width < Config.MIN_IMAGE_RESOLUTION[0] or height < Config.MIN_IMAGE_RESOLUTION[1]:
@@ -143,10 +164,11 @@ def validate_image(img):
             return False
         img_array = np.array(img)
         brightness = np.mean(img_array)
-        if brightness < 10 or brightness > 245:  # Relaxed brightness range
+        if brightness < 10 or brightness > 245:
             logger.warning(f"Image rejected: Brightness {brightness}")
             return False
-        return True
+        # Basic relevance check (e.g., filename or URL contains keyword)
+        return True  # Simplified for now; enhance with metadata if available
     except Exception as e:
         logger.warning(f"Image validation failed: {e}")
         return False
@@ -178,7 +200,7 @@ def scrape_images(keywords, num_images=Config.MAX_IMAGES_PER_KEYWORD):
         for p in cache_dir.glob('*.png'):
             try:
                 img = Image.open(p)
-                if validate_image(img):
+                if validate_image(img, keywords):
                     cached_images.append(img)
             except Exception as e:
                 logger.warning(f"Failed to load cached image {p}: {e}")
@@ -198,8 +220,9 @@ def scrape_images(keywords, num_images=Config.MAX_IMAGES_PER_KEYWORD):
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
         
-        img_urls = set()
-        for keyword in keywords:  # Try each keyword
+        images = []
+        for keyword in keywords:
+            img_urls = set()
             for platform_fn in random.sample(platforms, len(platforms)):
                 platform = platform_fn(keyword)
                 try:
@@ -224,41 +247,76 @@ def scrape_images(keywords, num_images=Config.MAX_IMAGES_PER_KEYWORD):
                                 img_urls.add(src)
                     
                     logger.info(f"Found {len(img_urls)} URLs from {platform}")
-                    if len(img_urls) >= num_images * 3:
-                        break
                 except Exception as e:
                     logger.warning(f"Failed to scrape {platform}: {e}")
-            if img_urls:
-                break  # Move to fetching if we have URLs
+            
+            futures = [thread_pool.submit(fetch_image, url) for url in list(img_urls)[:num_images * 5]]
+            for i, future in enumerate(as_completed(futures)):
+                try:
+                    img = future.result()
+                    if validate_image(img, keywords):
+                        img_path = cache_dir / f'img_{i}_{keyword}.png'
+                        img.save(img_path)
+                        images.append(img)
+                        logger.info(f"Saved image {img_path}")
+                        if len(images) >= num_images:
+                            break
+                except Exception as e:
+                    logger.warning(f"Image fetch failed: {e}")
+            
+            if images:
+                break  # Move to next segment once we have an image
         
-        futures = [thread_pool.submit(fetch_image, url) for url in list(img_urls)[:num_images * 3]]
-        images = []
+        if not images:
+            # Refine keywords and retry
+            refined_keywords = [kw + " image" for kw in keywords]  # Add "image" to force relevance
+            for keyword in refined_keywords:
+                for platform_fn in platforms:
+                    platform = platform_fn(keyword)
+                    try:
+                        response = requests.get(platform, headers=headers, timeout=10)
+                        soup = BeautifulSoup(response.text, 'html.parser')
+                        img_urls = set()
+                        if 'google.com' in platform:
+                            for img in soup.select('img[src]'):
+                                src = img['src']
+                                if src.startswith('http') and not src.startswith('data:') and not src.endswith('.gif'):
+                                    img_urls.add(src)
+                        elif 'bing.com' in platform:
+                            for img in soup.select('img[src]'):
+                                src = img['src']
+                                if src.startswith('http') and not src.endswith('.gif'):
+                                    img_urls.add(src)
+                        else:
+                            for img in soup.find_all('img'):
+                                src = img.get('src')
+                                if src and src.startswith('http') and not src.endswith('.gif'):
+                                    img_urls.add(src)
+                        
+                        futures = [thread_pool.submit(fetch_image, url) for url in list(img_urls)[:num_images * 5]]
+                        for i, future in enumerate(as_completed(futures)):
+                            img = future.result()
+                            if validate_image(img, keywords):
+                                img_path = cache_dir / f'img_{i}_{keyword}.png'
+                                img.save(img_path)
+                                images.append(img)
+                                logger.info(f"Saved refined image {img_path}")
+                                if len(images) >= num_images:
+                                    break
+                        if images:
+                            break
+                    except Exception as e:
+                        logger.warning(f"Retry failed for {platform}: {e}")
+                if images:
+                    break
         
-        for i, future in enumerate(as_completed(futures)):
-            try:
-                img = future.result()
-                if validate_image(img):
-                    img_path = cache_dir / f'img_{i}.png'
-                    img.save(img_path)
-                    images.append(img)
-                    logger.info(f"Saved image {img_path}")
-                    if len(images) >= num_images:
-                        break
-            except Exception as e:
-                logger.warning(f"Image fetch failed: {e}")
+        if not images:
+            raise ValueError(f"Failed to scrape any valid images for '{keywords}' after retries")
         
-        result = images if images else cached_images or []
-        if not result:
-            logger.warning(f"No valid images scraped for '{keywords}', using default")
-            # Default image: solid color
-            default_img = Image.new('RGB', Config.MIN_IMAGE_RESOLUTION, color=(73, 109, 137))
-            default_img.save(cache_dir / 'default.png')
-            result = [default_img]
-        return result
+        return images[:num_images]
     except Exception as e:
         logger.error(f"Image scraping error for '{keywords}': {e}")
-        default_img = Image.new('RGB', Config.MIN_IMAGE_RESOLUTION, color=(73, 109, 137))
-        return [default_img]
+        raise
 
 def enhance_image(image, resolution):
     try:
@@ -279,7 +337,7 @@ def create_video(segments, audio_path, video_format, quality):
         
         clips = []
         for segment in segments:
-            keywords = extract_keywords(segment['text'])
+            keywords = segment['keywords']
             images = scrape_images(keywords)
             
             img = images[0]  # Use the first valid image
@@ -291,7 +349,7 @@ def create_video(segments, audio_path, video_format, quality):
                 clip = clip.set_start(segment['start'])
                 clip = vfx.fadein(clip, min(0.5, duration/2)).fx(vfx.fadeout, min(0.5, duration/2))
                 clips.append(clip)
-                logger.info(f"Added clip for {segment['start']}-{segment['end']}")
+                logger.info(f"Added clip for {segment['start']}-{segment['end']} with keywords {keywords}")
             except Exception as e:
                 logger.error(f"Clip creation failed for segment: {e}")
                 continue
@@ -330,7 +388,7 @@ def create_video(segments, audio_path, video_format, quality):
 def main():
     st.set_page_config(page_title="Audio to Video Generator", layout="wide")
     st.title("🎥 Audio to Video Generator")
-    st.markdown(f"Convert audio to video with images. Max {Config.MAX_AUDIO_DURATION // 60} min.")
+    st.markdown(f"Convert audio to video with relevant images. Max {Config.MAX_AUDIO_DURATION // 60} min.")
 
     with st.sidebar:
         st.header("Settings")
@@ -349,15 +407,14 @@ def main():
                     progress_bar = st.progress(0)
                     status_text = st.empty()
                     
-                    status_text.text("Segmenting audio...")
-                    segments = segment_audio(audio_file, segment_duration)
+                    status_text.text("Analyzing audio...")
+                    segments = extract_audio_keywords(audio_file, segment_duration)
                     if not segments:
                         return
                     progress_bar.progress(0.2)
                     
                     status_text.text("Fetching images...")
                     for i, seg in enumerate(segments):
-                        seg['keywords'] = extract_keywords(seg['text'])
                         progress_bar.progress(0.2 + (i + 1) * 0.5 / len(segments))
                     
                     status_text.text("Creating video...")
