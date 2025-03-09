@@ -7,3 +7,5 @@ moviepy>=1.0.3
 soundfile>=0.10.0
 tenacity>=8.0.0
 validators>=0.18.0
+transformers>=4.30.0
+torch>=2.0.0
