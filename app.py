@@ -19,7 +19,6 @@ import validators
 import time
 import spacy
 import soundfile as sf
-from diffusers import KandinskyV22Pipeline
 import whisper
 
 # Setup logging
@@ -50,7 +49,13 @@ thread_pool = initialize_resources()
 def load_models():
     logger.info("Loading ML models...")
     whisper_model = whisper.load_model("tiny", device="cpu")
-    kandinsky_model = KandinskyV22Pipeline.from_pretrained("kandinsky-community/kandinsky-2-2-decoder").to("cpu")
+    kandinsky_model = None
+    try:
+        from diffusers import KandinskyV22Pipeline
+        kandinsky_model = KandinskyV22Pipeline.from_pretrained("kandinsky-community/kandinsky-2-2-decoder").to("cpu")
+        logger.info("Kandinsky model loaded successfully.")
+    except (ImportError, Exception) as e:
+        logger.warning(f"Failed to load Kandinsky model: {e}. AI image generation will be disabled.")
     return whisper_model, kandinsky_model
 
 whisper_model, kandinsky_model = load_models()
@@ -241,6 +246,8 @@ def scrape_images(transcription, keywords, used_keywords=None):
 def generate_image_task(transcription, keywords):
     from PIL import Image
     try:
+        if not kandinsky_model:
+            raise ValueError("Kandinsky model not available")
         prompt = f"A high quality, vibrant image depicting {transcription}, featuring {' and '.join(keywords)}, detailed and colorful"
         image = kandinsky_model(prompt, num_inference_steps=5, height=180, width=320).images[0]
         logger.info(f"Generated image for prompt: {prompt}")
@@ -341,6 +348,8 @@ def main():
     st.set_page_config(page_title="Audio to Video Generator", layout="wide")
     st.title("🎥 Audio to Video Generator")
     st.markdown(f"Convert audio to video with scraped or generated images. Max {Config.MAX_AUDIO_DURATION // 60} min.")
+    if not kandinsky_model:
+        st.warning("AI image generation is unavailable due to model loading issues. Only web scraping will be used.")
 
     with st.sidebar:
         st.header("Settings")
@@ -364,7 +373,10 @@ def main():
             st.text(f"Transcription: {segment['transcription']}")
             st.text(f"Keywords: {', '.join(segment['keywords'])}")
         
-        image_source = st.radio("Choose Image Source", ["Scrape from Web", "Generate with AI"], index=0)
+        image_source_options = ["Scrape from Web"]
+        if kandinsky_model:
+            image_source_options.append("Generate with AI")
+        image_source = st.radio("Choose Image Source", image_source_options, index=0)
         image_source_key = "scrape" if image_source == "Scrape from Web" else "generate"
         
         col1, col2 = st.columns(2)
