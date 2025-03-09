@@ -20,8 +20,8 @@ import tempfile
 import validators
 import re
 from collections import Counter
-import wave
-import struct
+from transformers import pipeline
+import torch
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 class Config:
     CACHE_DIR = Path('cache')
     MAX_CACHE_SIZE = 100 * 1024 * 1024  # 100MB
-    MAX_WORKERS = min(os.cpu_count() or 1, 4)  # Increased for scraping
+    MAX_WORKERS = min(os.cpu_count() or 1, 4)
     MAX_IMAGES_PER_KEYWORD = 1
     VIDEO_FPS = 24
     MIN_IMAGE_RESOLUTION = (150, 150)
@@ -70,7 +70,20 @@ def manage_cache():
 def get_file_hash(file_bytes):
     return hashlib.sha256(file_bytes).hexdigest()
 
-# Simple pure-Python speech-to-text using amplitude analysis (not full ASR, but keyword spotting)
+# Initialize transformers pipelines (local, no API)
+def initialize_pipelines():
+    try:
+        asr_pipeline = pipeline("automatic-speech-recognition", model="facebook/wav2vec2-base-960h", device=-1)  # CPU
+        ner_pipeline = pipeline("ner", model="dslim/bert-base-NER", device=-1)
+        logger.info("Transformers pipelines initialized")
+        return asr_pipeline, ner_pipeline
+    except Exception as e:
+        logger.error(f"Failed to initialize pipelines: {e}")
+        raise
+
+asr_pipeline, ner_pipeline = initialize_pipelines()
+
+# Audio transcription and keyword extraction
 def extract_audio_keywords(audio_file, segment_duration=Config.DEFAULT_SEGMENT_DURATION):
     try:
         file_bytes = audio_file.getvalue()
@@ -82,60 +95,63 @@ def extract_audio_keywords(audio_file, segment_duration=Config.DEFAULT_SEGMENT_D
             logger.info(f"Using cached segments: {cache_file}")
             return json.loads(cache_file.read_text())
 
-        # Convert to WAV for processing if needed
         audio_data, sample_rate = sf.read(BytesIO(file_bytes))
         total_duration = len(audio_data) / sample_rate
         
         if total_duration > Config.MAX_AUDIO_DURATION:
             raise ValueError(f"Audio exceeds {Config.MAX_AUDIO_DURATION // 60} minutes")
 
-        # Basic keyword dictionary (expandable)
-        keyword_dict = {
-            "music": ["music", "song", "melody"],
-            "nature": ["nature", "forest", "river"],
-            "city": ["city", "urban", "street"],
-            "people": ["people", "crowd", "person"],
-            "technology": ["tech", "computer", "device"],
-            "food": ["food", "meal", "dish"],
-            "travel": ["travel", "journey", "destination"]
-        }
-
         segments = []
         num_segments = int(total_duration // segment_duration)
         
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
             sf.write(tmp.name, audio_data, sample_rate)
-            with wave.open(tmp.name, 'rb') as wf:
-                frames = wf.getnframes()
-                frame_rate = wf.getframerate()
-                samples = wf.readframes(frames)
-                audio_samples = struct.unpack(f"{frames}h", samples)
-
-                for i in range(num_segments):
-                    start = i * segment_duration
-                    end = min((i + 1) * segment_duration, total_duration)
-                    start_frame = int(start * frame_rate)
-                    end_frame = int(end * frame_rate)
-                    segment_samples = audio_samples[start_frame:end_frame]
-                    
-                    # Simple amplitude-based keyword detection
-                    avg_amplitude = np.mean(np.abs(segment_samples))
-                    if avg_amplitude > 1000:  # Arbitrary threshold for speech/music
-                        keywords = random.choice(list(keyword_dict.values()))
-                    else:
-                        keywords = ["background", "silence", "scene"]
-                    
-                    segments.append({"start": start, "end": end, "keywords": keywords[:Config.MAX_KEYWORDS]})
+            for i in range(num_segments):
+                start = i * segment_duration
+                end = min((i + 1) * segment_duration, total_duration)
+                segment_audio = audio_data[int(start * sample_rate):int(end * sample_rate)]
                 
-                if total_duration % segment_duration:
-                    start = num_segments * segment_duration
-                    end = total_duration
-                    start_frame = int(start * frame_rate)
-                    end_frame = int(end * frame_rate)
-                    segment_samples = audio_samples[start_frame:end_frame]
-                    avg_amplitude = np.mean(np.abs(segment_samples))
-                    keywords = random.choice(list(keyword_dict.values())) if avg_amplitude > 1000 else ["background"]
-                    segments.append({"start": start, "end": end, "keywords": keywords[:Config.MAX_KEYWORDS]})
+                # Write segment to temporary file for ASR
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as seg_tmp:
+                    sf.write(seg_tmp.name, segment_audio, sample_rate)
+                    transcription = asr_pipeline(seg_tmp.name)["text"].lower()
+                    os.unlink(seg_tmp.name)
+                
+                # NER for entities
+                ner_results = ner_pipeline(transcription)
+                entities = [res["word"] for res in ner_results if res["entity"].startswith("B-") and len(res["word"]) > 3]
+                
+                # Frequency analysis for non-entities
+                words = re.findall(r'\b\w+\b', transcription)
+                stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'is', 'was', 'are'}
+                word_freq = Counter(word for word in words if word not in stop_words and len(word) > 3)
+                freq_keywords = [word for word, _ in word_freq.most_common(3)]
+                
+                # Combine and limit keywords
+                keywords = list(dict.fromkeys(entities + freq_keywords))[:Config.MAX_KEYWORDS]
+                if not keywords:
+                    keywords = ["scene"]  # Fallback, but should be rare with transcription
+                
+                segments.append({"start": start, "end": end, "keywords": keywords})
+                logger.info(f"Segment {i}: Keywords {keywords} from '{transcription}'")
+            
+            if total_duration % segment_duration:
+                start = num_segments * segment_duration
+                end = total_duration
+                segment_audio = audio_data[int(start * sample_rate):int(end * sample_rate)]
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as seg_tmp:
+                    sf.write(seg_tmp.name, segment_audio, sample_rate)
+                    transcription = asr_pipeline(seg_tmp.name)["text"].lower()
+                    os.unlink(seg_tmp.name)
+                
+                ner_results = ner_pipeline(transcription)
+                entities = [res["word"] for res in ner_results if res["entity"].startswith("B-") and len(res["word"]) > 3]
+                word_freq = Counter(word for word in re.findall(r'\b\w+\b', transcription) if word not in stop_words and len(word) > 3)
+                freq_keywords = [word for word, _ in word_freq.most_common(3)]
+                keywords = list(dict.fromkeys(entities + freq_keywords))[:Config.MAX_KEYWORDS] or ["scene"]
+                
+                segments.append({"start": start, "end": end, "keywords": keywords})
+                logger.info(f"Final segment: Keywords {keywords} from '{transcription}'")
 
         os.unlink(tmp.name)
         import json
@@ -167,8 +183,7 @@ def validate_image(img, keywords):
         if brightness < 10 or brightness > 245:
             logger.warning(f"Image rejected: Brightness {brightness}")
             return False
-        # Basic relevance check (e.g., filename or URL contains keyword)
-        return True  # Simplified for now; enhance with metadata if available
+        return True
     except Exception as e:
         logger.warning(f"Image validation failed: {e}")
         return False
@@ -265,11 +280,10 @@ def scrape_images(keywords, num_images=Config.MAX_IMAGES_PER_KEYWORD):
                     logger.warning(f"Image fetch failed: {e}")
             
             if images:
-                break  # Move to next segment once we have an image
+                break
         
         if not images:
-            # Refine keywords and retry
-            refined_keywords = [kw + " image" for kw in keywords]  # Add "image" to force relevance
+            refined_keywords = [kw + " photo" for kw in keywords]
             for keyword in refined_keywords:
                 for platform_fn in platforms:
                     platform = platform_fn(keyword)
@@ -337,16 +351,20 @@ def create_video(segments, audio_path, video_format, quality):
         
         clips = []
         for segment in segments:
-            keywords = segment['keywords']
+            if not isinstance(segment, dict) or "keywords" not in segment:
+                logger.error(f"Invalid segment format: {segment}")
+                raise ValueError(f"Segment must be a dict with 'keywords': {segment}")
+            
+            keywords = segment["keywords"]
             images = scrape_images(keywords)
             
-            img = images[0]  # Use the first valid image
+            img = images[0]
             enhanced_img = enhance_image(img, resolution)
             try:
                 clip = ImageSequenceClip([np.array(enhanced_img)], fps=Config.VIDEO_FPS)
-                duration = segment['end'] - segment['start']
+                duration = segment["end"] - segment["start"]
                 clip = clip.set_duration(duration)
-                clip = clip.set_start(segment['start'])
+                clip = clip.set_start(segment["start"])
                 clip = vfx.fadein(clip, min(0.5, duration/2)).fx(vfx.fadeout, min(0.5, duration/2))
                 clips.append(clip)
                 logger.info(f"Added clip for {segment['start']}-{segment['end']} with keywords {keywords}")
@@ -407,7 +425,7 @@ def main():
                     progress_bar = st.progress(0)
                     status_text = st.empty()
                     
-                    status_text.text("Analyzing audio...")
+                    status_text.text("Transcribing audio...")
                     segments = extract_audio_keywords(audio_file, segment_duration)
                     if not segments:
                         return
