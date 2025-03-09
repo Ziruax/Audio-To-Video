@@ -1,5 +1,5 @@
 streamlit
-librosa
+librosa==0.9.2
 numpy
 moviepy
 requests
@@ -15,3 +15,4 @@ transformers
 openai-whisper
 ffmpeg-python
 python-dotenv
+https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.0/en_core_web_sm-3.7.0.tar.gz
