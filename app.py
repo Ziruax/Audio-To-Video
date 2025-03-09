@@ -1,11 +1,7 @@
 import streamlit as st
-import torch
-from transformers import pipeline
-import spacy
 import requests
 from bs4 import BeautifulSoup
 from PIL import Image, ImageEnhance, ImageFilter, ImageDraw, ImageFont
-import cv2
 import numpy as np
 from moviepy.editor import ImageSequenceClip, VideoFileClip, AudioFileClip, concatenate_videoclips, vfx
 import os
@@ -22,7 +18,7 @@ import random
 from tenacity import retry, stop_after_attempt, wait_exponential
 import tempfile
 import validators
-import subprocess
+import re
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -39,49 +35,12 @@ class Config:
     MAX_AUDIO_DURATION = 3000  # 50 minutes
     DEFAULT_SEGMENT_DURATION = 5  # seconds
 
-# Initialize resources with robust model downloading
+# Initialize resources
 def initialize_resources():
     Config.CACHE_DIR.mkdir(exist_ok=True)
-    
-    # Ensure Spacy model is downloaded
-    model_name = 'en_core_web_sm'
-    try:
-        nlp = spacy.load(model_name)
-    except OSError:
-        logger.info(f"Spacy model '{model_name}' not found. Attempting to download...")
-        try:
-            # Use Spacy's built-in download command with a check for success
-            result = subprocess.run(
-                ["python", "-m", "spacy", "download", model_name],
-                check=True,
-                capture_output=True,
-                text=True
-            )
-            logger.info(f"Spacy model download output: {result.stdout}")
-            nlp = spacy.load(model_name)
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to download Spacy model: {e.stderr}")
-            raise RuntimeError(f"Could not download Spacy model '{model_name}': {e.stderr}")
-        except Exception as e:
-            logger.error(f"Unexpected error downloading Spacy model: {str(e)}")
-            raise RuntimeError(f"Unexpected error downloading Spacy model: {str(e)}")
-    
-    # Initialize other resources
-    transcriber = pipeline(
-        'automatic-speech-recognition',
-        model='openai/whisper-large-v3',
-        device=0 if torch.cuda.is_available() else -1
-    )
-    thread_pool = ThreadPoolExecutor(max_workers=Config.MAX_WORKERS)
-    
-    return nlp, transcriber, thread_pool
+    return ThreadPoolExecutor(max_workers=Config.MAX_WORKERS)
 
-# Initialize resources at startup
-try:
-    nlp, transcriber, thread_pool = initialize_resources()
-except Exception as e:
-    st.error(f"Failed to initialize resources: {str(e)}")
-    st.stop()
+thread_pool = initialize_resources()
 
 # Cache management
 def manage_cache():
@@ -103,75 +62,56 @@ def manage_cache():
 def get_file_hash(file_bytes):
     return hashlib.sha256(file_bytes).hexdigest()
 
-# Audio processing with segmentation
-def transcribe_and_segment_audio(audio_file, segment_duration=Config.DEFAULT_SEGMENT_DURATION):
+# Audio segmentation (without transcription)
+def segment_audio(audio_file, segment_duration=Config.DEFAULT_SEGMENT_DURATION):
     try:
         file_bytes = audio_file.getvalue()
         file_hash = get_file_hash(file_bytes)
-        cache_file = Config.CACHE_DIR / f'trans_{file_hash}.json'
+        cache_file = Config.CACHE_DIR / f'segments_{file_hash}.json'
 
         if cache_file.exists():
             import json
             return json.loads(cache_file.read_text())
 
-        with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp:
-            tmp.write(file_bytes)
-            tmp_path = tmp.name
-
-        result = transcriber(tmp_path, return_timestamps=True)
-        chunks = result['chunks']
-        audio = AudioFileClip(tmp_path)
-        total_duration = audio.duration
+        # Get audio duration using soundfile
+        audio_data, sample_rate = sf.read(BytesIO(file_bytes))
+        total_duration = len(audio_data) / sample_rate
         
         if total_duration > Config.MAX_AUDIO_DURATION:
             raise ValueError("Audio exceeds 50 minutes")
 
         num_segments = int(total_duration // segment_duration)
-        segmentsycat = []
+        segments = []
         
         for i in range(num_segments):
             start = i * segment_duration
             end = min((i + 1) * segment_duration, total_duration)
-            segment_chunks = [c for c in chunks if start <= c['timestamp'][0] < end]
-            segment_text = " ".join(c['text'] for c in segment_chunks)
-            segments.append({"start": start, "end": end, "text": segment_text})
+            segments.append({"start": start, "end": end, "text": f"Segment {i+1}"})  # Placeholder text
         
         if total_duration % segment_duration:
             start = num_segments * segment_duration
             end = total_duration
-            segment_chunks = [c for c in chunks if start <= c['timestamp'][0] < end]
-            segment_text = " ".join(c['text'] for c in segment_chunks)
-            segments.append({"start": start, "end": end, "text": segment_text})
+            segments.append({"start": start, "end": end, "text": f"Segment {num_segments+1}"})
 
         import json
         cache_file.write_text(json.dumps(segments))
         
-        os.unlink(tmp_path)
-        audio.close()
-        
         return segments
     except Exception as e:
-        logger.error(f"Audio processing error: {e}")
-        st.error(f"Failed to process audio: {e}")
+        logger.error(f"Audio segmentation error: {e}")
+        st.error(f"Failed to segment audio: {e}")
         return None
 
-# Text processing
+# Simple keyword extraction using pure Python
 def extract_keywords(text, min_keywords=3, max_keywords=10):
-    doc = nlp(text)
-    keywords = set()
+    # Basic tokenization and noun-like word extraction
+    words = re.findall(r'\b\w+\b', text.lower())
+    # Filter for potential keywords (longer words, no common stop words)
+    stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with'}
+    keywords = [word for word in words if len(word) > 3 and word not in stop_words]
     
-    for ent in doc.ents:
-        if ent.label_ in ['PERSON', 'ORG', 'GPE', 'PRODUCT', 'EVENT', 'WORK_OF_ART']:
-            keywords.add(ent.text)
-    
-    if len(keywords) < min_keywords:
-        for token in doc:
-            if token.pos_ in ['NOUN', 'PROPN'] and len(token.text) > 2:
-                keywords.add(token.text)
-                if len(keywords) >= max_keywords:
-                    break
-    
-    return list(keywords)[:max_keywords]
+    # Return unique keywords up to max_keywords
+    return list(dict.fromkeys(keywords))[:max_keywords] or ["generic", "scene"]
 
 # Image processing
 def get_resolution(video_format):
@@ -187,11 +127,7 @@ def validate_image(img):
         brightness = np.mean(img_array)
         if brightness < 30 or brightness > 225:
             return False
-            
-        sharpness = cv2.Laplacian(cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY), cv2.CV_64F).var()
-        if sharpness < 150:
-            return False
-            
+        
         return True
     except Exception:
         return False
@@ -266,10 +202,7 @@ def scrape_images(keyword, num_images=Config.MAX_IMAGES_PER_KEYWORD):
 def create_text_image(text, resolution):
     img = Image.new('RGB', resolution, color=(73, 109, 137))
     d = ImageDraw.Draw(img)
-    try:
-        font = ImageFont.truetype("arial.ttf", 40)
-    except:
-        font = ImageFont.load_default()
+    font = ImageFont.load_default()  # Use default font, no external dependency
     d.text((10, 10), text, font=font, fill=(255, 255, 0))
     path = Config.CACHE_DIR / f"text_{int(time.time())}.png"
     img.save(path)
@@ -278,19 +211,8 @@ def create_text_image(text, resolution):
 def enhance_image(image, resolution):
     try:
         image = image.resize(resolution, Image.LANCZOS)
-        
-        img_array = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-        img_array = cv2.fastNlMeansDenoisingColored(img_array, None, 10, 10, 7, 21)
-        lab = cv2.cvtColor(img_array, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        l = clahe.apply(l)
-        img_array = cv2.cvtColor(cv2.merge((l,a,b)), cv2.COLOR_LAB2BGR)
-        
-        img_pil = Image.fromarray(cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB))
-        img_pil = img_pil.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
-        enhancer = ImageEnhance.Color(img_pil).enhance(1.15)
-        return ImageEnhance.Contrast(enhancer).enhance(1.1)
+        img_pil = ImageEnhance.Color(image).enhance(1.15)
+        return ImageEnhance.Contrast(img_pil).enhance(1.1)
     except Exception as e:
         logger.error(f"Image enhancement error: {e}")
         return image
@@ -351,7 +273,7 @@ def create_video(segments, audio_path, video_format):
 def main():
     st.set_page_config(page_title="Audio to Video Generator", layout="wide")
     st.title("🎥 Audio to Video Generator")
-    st.markdown("Convert your audio into engaging videos with AI-generated visuals")
+    st.markdown("Convert your audio into videos with synchronized images. Note: Transcription not available; uses segment placeholders.")
 
     with st.sidebar:
         st.header("Settings")
@@ -370,8 +292,8 @@ def main():
                     progress_bar = st.progress(0)
                     status_text = st.empty()
                     
-                    status_text.text("Processing audio and segmenting...")
-                    segments = transcribe_and_segment_audio(audio_file, segment_duration)
+                    status_text.text("Segmenting audio...")
+                    segments = segment_audio(audio_file, segment_duration)
                     if not segments:
                         return
                     progress_bar.progress(0.2)
