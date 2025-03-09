@@ -19,6 +19,8 @@ import validators
 import time
 import spacy
 import soundfile as sf
+from diffusers import KandinskyV22Pipeline
+import whisper
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -43,6 +45,16 @@ def initialize_resources():
 
 thread_pool = initialize_resources()
 
+# Load models once
+@st.cache_resource
+def load_models():
+    logger.info("Loading ML models...")
+    whisper_model = whisper.load_model("tiny", device="cpu")
+    kandinsky_model = KandinskyV22Pipeline.from_pretrained("kandinsky-community/kandinsky-2-2-decoder").to("cpu")
+    return whisper_model, kandinsky_model
+
+whisper_model, kandinsky_model = load_models()
+
 # Cache management
 def manage_cache():
     try:
@@ -62,13 +74,11 @@ def manage_cache():
 def transcribe_segment(args):
     audio_data, sample_rate, start, end = args
     try:
-        import whisper
-        model = whisper.load_model("tiny", device="cpu")
         segment_audio = audio_data[int(start * sample_rate):int(end * sample_rate)]
         segment_audio = segment_audio.astype(np.float32) / (np.max(np.abs(segment_audio)) or 1)
         audio_path = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
         sf.write(audio_path, segment_audio, sample_rate)
-        result = model.transcribe(audio_path, language="en")
+        result = whisper_model.transcribe(audio_path, language="en")
         os.unlink(audio_path)
         return result["text"]
     except Exception as e:
@@ -91,6 +101,7 @@ def extract_keywords_from_transcription(transcription):
         logger.warning(f"Keyword extraction error: {e}")
         return ["default"]
 
+@st.cache_data
 def extract_transcribed_keywords(audio_file, segment_duration=Config.DEFAULT_SEGMENT_DURATION):
     try:
         file_bytes = audio_file.getvalue()
@@ -192,7 +203,7 @@ def scrape_images(transcription, keywords, used_keywords=None):
             except Exception:
                 pass
 
-        query = f"{transcription} high quality photo {' '.join(keywords)}"
+        query = f"{transcription} high quality {' '.join(keywords)} site:*.edu | site:*.org | site:*.gov -inurl:(login | signup)"
         platforms = [
             "https://www.pexels.com/search/{query}/",
             "https://unsplash.com/s/photos/{query}",
@@ -224,18 +235,14 @@ def scrape_images(transcription, keywords, used_keywords=None):
         return Image.new("RGB", (320, 180), "gray")
     except Exception as e:
         logger.error(f"Image scraping error for '{keywords}': {e}")
-        return Image.new("RGB", (320, 180), "gray"))
+        return Image.new("RGB", (320, 180), "gray")
 
 # Image generation
 def generate_image_task(transcription, keywords):
-    import torch
-    from diffusers import KandinskyV22Pipeline
     from PIL import Image
     try:
-        pipe = KandinskyV22Pipeline.from_pretrained("kandinsky-community/kandinsky-2-2-decoder")
-        pipe = pipe.to("cpu")
         prompt = f"A high quality, vibrant image depicting {transcription}, featuring {' and '.join(keywords)}, detailed and colorful"
-        image = pipe(prompt, num_inference_steps=5, height=180, width=320).images[0]
+        image = kandinsky_model(prompt, num_inference_steps=5, height=180, width=320).images[0]
         logger.info(f"Generated image for prompt: {prompt}")
         return image
     except Exception as e:
@@ -318,8 +325,8 @@ def create_video(segments, audio_path, image_source, quality, video_format):
         logger.info(f"Video created at {output_path}")
         return output_path
     except Exception as e:
-        logger.error(f"Video creation error: {e}")
-        st.error(f"Failed to create video: {e}")
+        logger.error(f"Video creation failed: {str(e)}")
+        st.error("Video generation failed. Please check the audio file and try again.")
         return None
     finally:
         if 'final_clip' in locals():
@@ -345,9 +352,11 @@ def main():
     
     if audio_file:
         st.subheader("Audio Transcription")
-        with st.spinner("Transcribing audio..."):
+        with st.status("Processing audio...", expanded=True) as status:
+            status.write("Transcribing audio...")
             segments = extract_transcribed_keywords(audio_file, segment_duration)
             if not segments:
+                status.update(label="Transcription failed", state="error")
                 return
         
         for i, segment in enumerate(segments):
@@ -361,34 +370,35 @@ def main():
         col1, col2 = st.columns(2)
         with col1:
             if st.button("Generate Video"):
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                status_text.text("Processing audio segments...")
-                progress_bar.progress(0.2)
-                
-                status_text.text(f"{'Scraping images' if image_source_key == 'scrape' else 'Generating images'}...")
-                with tempfile.NamedTemporaryFile(suffix=".mp3") as tmp_audio:
-                    tmp_audio.write(audio_file.getvalue())
-                    video_path = create_video(segments, tmp_audio.name, image_source_key, quality, video_format)
-                progress_bar.progress(0.8)
-                
-                if video_path:
-                    status_text.text("Finalizing video...")
-                    progress_bar.progress(1.0)
-                    st.success("Video generated successfully!")
-                    st.video(video_path)
-                    with open(video_path, "rb") as f:
-                        st.download_button(
-                            "Download Video",
-                            f,
-                            file_name=f"generated_video_{time.strftime('%Y%m%d_%H%M%S')}.mp4",
-                            mime="video/mp4"
-                        )
-                    os.unlink(video_path)
-                else:
-                    progress_bar.progress(0)
-                    status_text.text("Failed to generate video. Check logs for details.")
+                with st.status("Generating video...", expanded=True) as status:
+                    status.write("Processing audio segments...")
+                    progress_bar = st.progress(0)
+                    progress_bar.progress(0.2)
+                    
+                    status.write(f"{'Scraping images' if image_source_key == 'scrape' else 'Generating images'}...")
+                    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_audio:
+                        tmp_audio.write(audio_file.getvalue())
+                        tmp_audio_path = tmp_audio.name
+                        video_path = create_video(segments, tmp_audio_path, image_source_key, quality, video_format)
+                    progress_bar.progress(0.8)
+                    
+                    if video_path:
+                        status.write("Rendering video...")
+                        progress_bar.progress(1.0)
+                        status.update(label="Video generated successfully!", state="complete")
+                        st.video(video_path)
+                        with open(video_path, "rb") as f:
+                            st.download_button(
+                                "Download Video",
+                                f,
+                                file_name=f"generated_video_{time.strftime('%Y%m%d_%H%M%S')}.mp4",
+                                mime="video/mp4"
+                            )
+                        os.unlink(video_path)
+                        os.unlink(tmp_audio_path)
+                    else:
+                        progress_bar.progress(0)
+                        status.update(label="Video generation failed", state="error")
         with col2:
             st.audio(audio_file)
 
