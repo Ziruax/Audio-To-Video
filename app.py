@@ -2,8 +2,7 @@ import streamlit as st
 import librosa
 import numpy as np
 import moviepy.editor as mpy
-from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
-from diffusers import StableDiffusionPipeline
+from diffusers import KandinskyV22Pipeline
 import requests
 from bs4 import BeautifulSoup
 from PIL import Image, ImageEnhance
@@ -18,7 +17,6 @@ import tempfile
 import hashlib
 from tenacity import retry, stop_after_attempt, wait_exponential
 import validators
-import torch
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -30,10 +28,10 @@ class Config:
     MAX_CACHE_SIZE = 100 * 1024 * 1024  # 100MB
     MAX_AUDIO_DURATION = 600  # 10 minutes
     DEFAULT_SEGMENT_DURATION = 5
-    MAX_KEYWORDS = 3
+    MAX_KEYWORDS = 2  # Reduced for speed
     VIDEO_FPS = 24
     MIN_IMAGE_RESOLUTION = (150, 150)
-    MAX_WORKERS = min(os.cpu_count() or 1, 4)
+    MAX_WORKERS = min(os.cpu_count() or 1, 2)  # Reduced workers
 
 # Initialize resources
 def initialize_resources():
@@ -62,21 +60,7 @@ def manage_cache():
     except Exception as e:
         logger.warning(f"Cache management error: {e}")
 
-# Initialize lightweight models
-try:
-    asr_pipeline = pipeline("automatic-speech-recognition", model="facebook/wav2vec2-base-960h", device=-1)
-    ner_pipeline = pipeline("ner", model="dslim/bert-base-NER", device=-1)
-    tokenizer = AutoTokenizer.from_pretrained("distilgpt2")
-    text_model = AutoModelForCausalLM.from_pretrained("distilgpt2")
-    image_gen_pipeline = StableDiffusionPipeline.from_pretrained("stabilityai/stable-diffusion-2-1")
-    image_gen_pipeline = image_gen_pipeline.to("cpu")  # Ensure CPU usage for Streamlit Cloud
-    logger.info("All models initialized successfully")
-except Exception as e:
-    logger.error(f"Model initialization failed: {e}")
-    st.error(f"Failed to initialize models: {e}")
-    asr_pipeline = ner_pipeline = tokenizer = text_model = image_gen_pipeline = None
-
-# Audio transcription and keyword extraction
+# Audio feature extraction and keyword mapping
 def extract_audio_keywords(audio_file, segment_duration=Config.DEFAULT_SEGMENT_DURATION):
     try:
         file_bytes = audio_file.getvalue()
@@ -87,7 +71,7 @@ def extract_audio_keywords(audio_file, segment_duration=Config.DEFAULT_SEGMENT_D
             logger.info(f"Using cached segments: {cache_file}")
             return json.loads(cache_file.read_text())
 
-        audio_data, sample_rate = librosa.load(BytesIO(file_bytes), sr=None)
+        audio_data, sample_rate = librosa.load(BytesIO(file_bytes), sr=16000)  # Downsample for speed
         total_duration = len(audio_data) / sample_rate
         
         if total_duration > Config.MAX_AUDIO_DURATION:
@@ -96,29 +80,39 @@ def extract_audio_keywords(audio_file, segment_duration=Config.DEFAULT_SEGMENT_D
         segments = []
         num_segments = int(total_duration // segment_duration)
         
+        keyword_pool = {
+            "high_energy": ["party", "dance", "concert", "action"],
+            "music": ["music", "song", "melody", "guitar"],
+            "speech": ["conversation", "meeting", "people", "talk"],
+            "calm": ["nature", "forest", "river", "sky"],
+            "silence": ["abstract", "pattern", "texture", "scene"]
+        }
+
         for i in range(num_segments + (1 if total_duration % segment_duration else 0)):
             start = i * segment_duration
             end = min((i + 1) * segment_duration, total_duration)
             segment_audio = audio_data[int(start * sample_rate):int(end * sample_rate)]
-            segment_audio = segment_audio.astype(np.float32) / (np.max(np.abs(segment_audio)) or 1)  # Avoid division by zero
             
-            # Transcription
-            transcription = asr_pipeline({"raw": segment_audio, "sampling_rate": sample_rate})["text"].lower()
+            # Extract features
+            energy = np.mean(librosa.feature.rms(y=segment_audio)[0])
+            pitch = np.mean(librosa.pitch_tuning(segment_audio)) if energy > 0.01 else 0
+            tempo = librosa.beat.tempo(y=segment_audio, sr=sample_rate)[0] if energy > 0.01 else 0
             
-            # NER for entities
-            ner_results = ner_pipeline(transcription)
-            entities = [res["word"] for res in ner_results if res["entity"].startswith("B-") and len(res["word"]) > 2]
+            # Map features to category
+            if energy > 0.1 and tempo > 120:
+                category = "high_energy"
+            elif energy > 0.05 and tempo > 60:
+                category = "music"
+            elif energy > 0.02 and abs(pitch) > 0.1:
+                category = "speech"
+            elif energy > 0.005:
+                category = "calm"
+            else:
+                category = "silence"
             
-            # Refine with distilgpt2 if needed
-            if not entities:
-                inputs = tokenizer(transcription, return_tensors="pt", truncation=True, max_length=50)
-                outputs = text_model.generate(**inputs, max_new_tokens=20, num_return_sequences=1, pad_token_id=tokenizer.eos_token_id)
-                refined_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-                entities = [word for word in refined_text.split() if len(word) > 2][:Config.MAX_KEYWORDS]
-            
-            keywords = list(dict.fromkeys(entities))[:Config.MAX_KEYWORDS] or ["scene"]
-            segments.append({"start": start, "end": end, "keywords": keywords, "transcription": transcription})
-            logger.info(f"Segment {i}: Keywords {keywords} from '{transcription}'")
+            keywords = random.sample(keyword_pool[category], min(Config.MAX_KEYWORDS, len(keyword_pool[category])))
+            segments.append({"start": start, "end": end, "keywords": keywords})
+            logger.info(f"Segment {i}: Keywords {keywords} (energy: {energy:.4f}, tempo: {tempo:.1f})")
         
         cache_file.write_text(json.dumps(segments))
         logger.info(f"Segmented audio into {len(segments)} segments")
@@ -135,11 +129,12 @@ def fetch_image(url):
         if not validators.url(url):
             raise ValueError("Invalid URL")
         headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=5)  # Reduced timeout
         response.raise_for_status()
         img = Image.open(BytesIO(response.content)).convert('RGB')
-        logger.info(f"Fetched image from {url}")
-        return img
+        if img.size >= Config.MIN_IMAGE_RESOLUTION:
+            return img
+        raise ValueError("Image too small")
     except Exception as e:
         logger.warning(f"Failed to fetch image from {url}: {e}")
         raise
@@ -166,73 +161,65 @@ def scrape_images(keywords, used_keywords=None):
             return cached_images[0]
 
         platforms = [
-            lambda kw: f'https://www.google.com/search?q={quote(kw)}&tbm=isch',
-            lambda kw: f'https://www.bing.com/images/search?q={quote(kw)}',
-            lambda kw: f'https://www.pexels.com/search/{quote(kw)}/',
-            lambda kw: f'https://unsplash.com/s/photos/{quote(kw)}'
+            f"https://www.google.com/search?q={'+'.join(keywords)}&tbm=isch",
+            f"https://www.bing.com/images/search?q={'+'.join(keywords)}",
+            f"https://www.pexels.com/search/{'+'.join(keywords)}/",
         ]
         
         headers = {'User-Agent': 'Mozilla/5.0'}
-        for keyword in keywords:
-            if keyword in used_keywords:
-                continue
-            img_urls = set()
-            for platform_fn in platforms:
-                platform = platform_fn(keyword)
-                try:
-                    response = requests.get(platform, headers=headers, timeout=10)
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    for img in soup.select('img[src]'):
-                        src = img['src']
-                        if src.startswith('http') and not src.endswith('.gif'):
-                            img_urls.add(src)
-                except Exception as e:
-                    logger.warning(f"Failed to scrape {platform}: {e}")
-            
-            futures = [thread_pool.submit(fetch_image, url) for url in list(img_urls)[:5]]
-            for future in as_completed(futures):
-                try:
-                    img = future.result()
-                    if img.size >= Config.MIN_IMAGE_RESOLUTION:
-                        img_path = cache_dir / f'img_{keyword}.png'
-                        img.save(img_path)
-                        used_keywords.add(keyword)
-                        logger.info(f"Saved scraped image {img_path}")
-                        return img
-                except Exception:
-                    pass
+        for platform in platforms:
+            try:
+                response = requests.get(platform, headers=headers, timeout=5)
+                soup = BeautifulSoup(response.text, 'html.parser')
+                img_urls = [img['src'] for img in soup.select('img[src]') if img['src'].startswith('http') and not img['src'].endswith('.gif')]
+                if img_urls:
+                    futures = [thread_pool.submit(fetch_image, url) for url in img_urls[:3]]  # Limit to 3 attempts
+                    for future in as_completed(futures):
+                        try:
+                            img = future.result()
+                            img_path = cache_dir / f'img_{keywords[0]}.png'
+                            img.save(img_path)
+                            used_keywords.update(keywords)
+                            logger.info(f"Saved scraped image {img_path}")
+                            return img
+                        except Exception:
+                            pass
+            except Exception as e:
+                logger.warning(f"Failed to scrape {platform}: {e}")
         
         logger.warning(f"No valid images scraped for '{keywords}'")
-        return Image.new("RGB", (640, 360), "gray")  # Fallback image
+        return Image.new("RGB", (320, 180), "gray")
     except Exception as e:
         logger.error(f"Image scraping error: {e}")
-        return Image.new("RGB", (640, 360), "gray")
+        return Image.new("RGB", (320, 180), "gray")
 
 # Image generation
-def generate_image(keywords, transcription):
+def generate_image(keywords):
     try:
-        prompt = f"{transcription}, high quality, detailed, vibrant colors"
-        image = image_gen_pipeline(prompt, num_inference_steps=20).images[0]  # Reduced steps for speed
+        pipe = KandinskyV22Pipeline.from_pretrained("kandinsky-community/kandinsky-2-2-decoder")
+        pipe = pipe.to("cpu")
+        prompt = " ".join(keywords) + ", simple, vibrant"
+        image = pipe(prompt, num_inference_steps=10, height=180, width=320).images[0]  # Low res for speed
         logger.info(f"Generated image for prompt: {prompt}")
         return image
     except Exception as e:
         logger.error(f"Image generation error: {e}")
-        return Image.new("RGB", (640, 360), "gray")
+        return Image.new("RGB", (320, 180), "gray")
 
 # Image enhancement
 def enhance_image(image, resolution):
     try:
         image = image.resize(resolution, Image.Resampling.LANCZOS)
-        return ImageEnhance.Contrast(image).enhance(1.2)
+        return ImageEnhance.Contrast(image).enhance(1.1)
     except Exception:
         return image
 
 # Video creation
-def create_video(segments, audio_path, image_source, video_format, quality):
+def create_video(segments, audio_path, image_source, quality):
     output_path = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False).name
     try:
         audio = mpy.AudioFileClip(audio_path)
-        resolution = {"Low": (640, 360), "Medium": (960, 540), "High": (1280, 720)}[quality]  # Simplified resolutions
+        resolution = {"Low": (320, 180), "Medium": (640, 360), "High": (960, 540)}[quality]
         
         clips = []
         used_keywords = set()
@@ -242,20 +229,15 @@ def create_video(segments, audio_path, image_source, video_format, quality):
                 keywords = (keywords[0] + str(random.randint(1, 1000)),)
             used_keywords.add(keywords)
             
-            if image_source == "scrape":
-                img = scrape_images(segment["keywords"], used_keywords)
-            else:
-                img = generate_image(segment["keywords"], segment["transcription"])
-            
+            img = scrape_images(segment["keywords"], used_keywords) if image_source == "scrape" else generate_image(segment["keywords"])
             enhanced_img = enhance_image(img, resolution)
             clip = mpy.ImageSequenceClip([np.array(enhanced_img)], fps=Config.VIDEO_FPS)
             clip = clip.set_duration(segment["end"] - segment["start"]).set_start(segment["start"])
-            clip = clip.fx(mpy.vfx.fadein, 0.5).fx(mpy.vfx.fadeout, 0.5)
             clips.append(clip)
         
         final_clip = mpy.concatenate_videoclips(clips, method="compose").set_audio(audio)
         preset = {"Low": "veryfast", "Medium": "fast", "High": "medium"}[quality]
-        final_clip.write_videofile(output_path, codec="libx264", audio_codec="aac", fps=Config.VIDEO_FPS, preset=preset)
+        final_clip.write_videofile(output_path, codec="libx264", audio_codec="aac", fps=Config.VIDEO_FPS, preset=preset, logger=None)
         logger.info(f"Video created at {output_path}")
         return output_path
     except Exception as e:
@@ -274,12 +256,11 @@ def create_video(segments, audio_path, image_source, video_format, quality):
 def main():
     st.set_page_config(page_title="Audio to Video Generator", layout="wide")
     st.title("🎥 Audio to Video Generator")
-    st.markdown(f"Convert audio to video with scraped or generated images. Max {Config.MAX_AUDIO_DURATION // 60} min.")
+    st.markdown(f"Convert audio to video with images. Max {Config.MAX_AUDIO_DURATION // 60} min.")
 
     with st.sidebar:
         st.header("Settings")
         segment_duration = st.slider("Segment Duration (seconds)", 3, 10, Config.DEFAULT_SEGMENT_DURATION)
-        video_format = st.selectbox("Video Format", ["16:9"], index=0)  # Simplified for now
         quality = st.selectbox("Video Quality", ["Low", "Medium", "High"], index=1)
 
     audio_file = st.file_uploader("Upload Audio File (mp3, wav, m4a)", type=["mp3", "wav", "m4a"])
@@ -299,7 +280,7 @@ def main():
                     with st.spinner(f"{'Scraping images' if image_source_key == 'scrape' else 'Generating images'}..."):
                         with tempfile.NamedTemporaryFile(suffix=".mp3") as tmp_audio:
                             tmp_audio.write(audio_file.getvalue())
-                            video_path = create_video(segments, tmp_audio.name, image_source_key, video_format, quality)
+                            video_path = create_video(segments, tmp_audio.name, image_source_key, quality)
                     
                     if video_path:
                         st.success("Video generated successfully!")
