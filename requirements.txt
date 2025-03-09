@@ -12,7 +12,7 @@ tenacity==8.2.3
 torch==1.13.1
 diffusers==0.20.2
 transformers==4.31.0
-openai-whisper==2023.11.17
+openai-whisper
 ffmpeg-python==0.2.0
 python-dotenv==1.0.0
 accelerate==0.20.3
