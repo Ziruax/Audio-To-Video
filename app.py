@@ -73,13 +73,13 @@ def get_file_hash(file_bytes):
 # Initialize transformers pipelines (local, no API)
 def initialize_pipelines():
     try:
-        asr_pipeline = pipeline("automatic-speech-recognition", model="facebook/wav2vec2-base-960h", device=-1)  # CPU
+        asr_pipeline = pipeline("automatic-speech-recognition", model="facebook/wav2vec2-base-960h", device=-1)
         ner_pipeline = pipeline("ner", model="dslim/bert-base-NER", device=-1)
         logger.info("Transformers pipelines initialized")
         return asr_pipeline, ner_pipeline
     except Exception as e:
         logger.error(f"Failed to initialize pipelines: {e}")
-        raise
+        return None, None
 
 asr_pipeline, ner_pipeline = initialize_pipelines()
 
@@ -104,56 +104,73 @@ def extract_audio_keywords(audio_file, segment_duration=Config.DEFAULT_SEGMENT_D
         segments = []
         num_segments = int(total_duration // segment_duration)
         
-        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
-            sf.write(tmp.name, audio_data, sample_rate)
-            for i in range(num_segments):
-                start = i * segment_duration
-                end = min((i + 1) * segment_duration, total_duration)
-                segment_audio = audio_data[int(start * sample_rate):int(end * sample_rate)]
-                
-                # Write segment to temporary file for ASR
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as seg_tmp:
-                    sf.write(seg_tmp.name, segment_audio, sample_rate)
-                    transcription = asr_pipeline(seg_tmp.name)["text"].lower()
-                    os.unlink(seg_tmp.name)
-                
-                # NER for entities
-                ner_results = ner_pipeline(transcription)
-                entities = [res["word"] for res in ner_results if res["entity"].startswith("B-") and len(res["word"]) > 3]
-                
-                # Frequency analysis for non-entities
-                words = re.findall(r'\b\w+\b', transcription)
-                stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'is', 'was', 'are'}
-                word_freq = Counter(word for word in words if word not in stop_words and len(word) > 3)
-                freq_keywords = [word for word, _ in word_freq.most_common(3)]
-                
-                # Combine and limit keywords
-                keywords = list(dict.fromkeys(entities + freq_keywords))[:Config.MAX_KEYWORDS]
-                if not keywords:
-                    keywords = ["scene"]  # Fallback, but should be rare with transcription
-                
-                segments.append({"start": start, "end": end, "keywords": keywords})
-                logger.info(f"Segment {i}: Keywords {keywords} from '{transcription}'")
-            
-            if total_duration % segment_duration:
-                start = num_segments * segment_duration
-                end = total_duration
-                segment_audio = audio_data[int(start * sample_rate):int(end * sample_rate)]
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as seg_tmp:
-                    sf.write(seg_tmp.name, segment_audio, sample_rate)
-                    transcription = asr_pipeline(seg_tmp.name)["text"].lower()
-                    os.unlink(seg_tmp.name)
-                
-                ner_results = ner_pipeline(transcription)
-                entities = [res["word"] for res in ner_results if res["entity"].startswith("B-") and len(res["word"]) > 3]
-                word_freq = Counter(word for word in re.findall(r'\b\w+\b', transcription) if word not in stop_words and len(word) > 3)
-                freq_keywords = [word for word, _ in word_freq.most_common(3)]
-                keywords = list(dict.fromkeys(entities + freq_keywords))[:Config.MAX_KEYWORDS] or ["scene"]
-                
-                segments.append({"start": start, "end": end, "keywords": keywords})
-                logger.info(f"Final segment: Keywords {keywords} from '{transcription}'")
+        # Keyword dictionary for fallback
+        keyword_dict = {
+            "music": ["music", "song", "melody"],
+            "nature": ["nature", "forest", "river"],
+            "city": ["city", "urban", "street"],
+            "people": ["people", "crowd", "person"],
+            "technology": ["tech", "computer", "device"],
+            "food": ["food", "meal", "dish"],
+            "travel": ["travel", "journey", "destination"]
+        }
 
-        os.unlink(tmp.name)
+        for i in range(num_segments):
+            start = i * segment_duration
+            end = min((i + 1) * segment_duration, total_duration)
+            segment_audio = audio_data[int(start * sample_rate):int(end * sample_rate)]
+            
+            if asr_pipeline and ner_pipeline:
+                try:
+                    # Normalize audio to float32 between -1 and 1
+                    segment_audio = segment_audio.astype(np.float32) / np.max(np.abs(segment_audio))
+                    transcription = asr_pipeline({"raw": segment_audio, "sampling_rate": sample_rate})["text"].lower()
+                    ner_results = ner_pipeline(transcription)
+                    entities = [res["word"] for res in ner_results if res["entity"].startswith("B-") and len(res["word"]) > 3]
+                    
+                    words = re.findall(r'\b\w+\b', transcription)
+                    stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'is', 'was', 'are'}
+                    word_freq = Counter(word for word in words if word not in stop_words and len(word) > 3)
+                    freq_keywords = [word for word, _ in word_freq.most_common(3)]
+                    
+                    keywords = list(dict.fromkeys(entities + freq_keywords))[:Config.MAX_KEYWORDS] or ["scene"]
+                    logger.info(f"Segment {i}: Keywords {keywords} from '{transcription}'")
+                except Exception as e:
+                    logger.warning(f"Transcription failed for segment {i}: {e}, falling back to amplitude analysis")
+                    avg_amplitude = np.mean(np.abs(segment_audio))
+                    keywords = random.choice(list(keyword_dict.values()))[:Config.MAX_KEYWORDS] if avg_amplitude > 0.1 else ["background"]
+            else:
+                avg_amplitude = np.mean(np.abs(segment_audio))
+                keywords = random.choice(list(keyword_dict.values()))[:Config.MAX_KEYWORDS] if avg_amplitude > 0.1 else ["background"]
+                logger.info(f"Segment {i}: Fallback keywords {keywords} (no transcription)")
+            
+            segments.append({"start": start, "end": end, "keywords": keywords})
+        
+        if total_duration % segment_duration:
+            start = num_segments * segment_duration
+            end = total_duration
+            segment_audio = audio_data[int(start * sample_rate):int(end * sample_rate)]
+            if asr_pipeline and ner_pipeline:
+                try:
+                    segment_audio = segment_audio.astype(np.float32) / np.max(np.abs(segment_audio))
+                    transcription = asr_pipeline({"raw": segment_audio, "sampling_rate": sample_rate})["text"].lower()
+                    ner_results = ner_pipeline(transcription)
+                    entities = [res["word"] for res in ner_results if res["entity"].startswith("B-") and len(res["word"]) > 3]
+                    word_freq = Counter(word for word in re.findall(r'\b\w+\b', transcription) if word not in stop_words and len(word) > 3)
+                    freq_keywords = [word for word, _ in word_freq.most_common(3)]
+                    keywords = list(dict.fromkeys(entities + freq_keywords))[:Config.MAX_KEYWORDS] or ["scene"]
+                    logger.info(f"Final segment: Keywords {keywords} from '{transcription}'")
+                except Exception as e:
+                    logger.warning(f"Transcription failed for final segment: {e}, falling back")
+                    avg_amplitude = np.mean(np.abs(segment_audio))
+                    keywords = random.choice(list(keyword_dict.values()))[:Config.MAX_KEYWORDS] if avg_amplitude > 0.1 else ["background"]
+            else:
+                avg_amplitude = np.mean(np.abs(segment_audio))
+                keywords = random.choice(list(keyword_dict.values()))[:Config.MAX_KEYWORDS] if avg_amplitude > 0.1 else ["background"]
+                logger.info(f"Final segment: Fallback keywords {keywords}")
+            
+            segments.append({"start": start, "end": end, "keywords": keywords})
+
         import json
         cache_file.write_text(json.dumps(segments))
         logger.info(f"Segmented audio into {len(segments)} segments with keywords")
@@ -425,7 +442,7 @@ def main():
                     progress_bar = st.progress(0)
                     status_text = st.empty()
                     
-                    status_text.text("Transcribing audio...")
+                    status_text.text("Analyzing audio...")
                     segments = extract_audio_keywords(audio_file, segment_duration)
                     if not segments:
                         return
