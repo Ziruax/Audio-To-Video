@@ -1,13 +1,9 @@
 streamlit>=1.20.0
-torch>=1.9.0
-transformers>=4.35.0  # For Whisper-large-v3
-spacy>=3.0.0
 requests>=2.25.0
 beautifulsoup4>=4.9.0
 pillow>=8.0.0
-opencv-python-headless>=4.5.0  # Headless version for cloud compatibility
-moviepy>=1.0.3
-soundfile>=0.10.0
 numpy>=1.19.0
+moviepy>=1.0.3
+soundfile>=0.10.0  # For audio duration, no external models needed
 tenacity>=8.0.0
 validators>=0.18.0
