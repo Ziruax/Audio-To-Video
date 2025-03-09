@@ -12,3 +12,4 @@ tenacity==8.2.3
 openai-whisper==20231117
 ffmpeg-python==0.2.0
 en-core-web-sm==3.6.0
+setuptools==74.1.2  # Added to provide distutils for Python 3.12
